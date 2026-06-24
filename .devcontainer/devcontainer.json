@@ -1,0 +1,20 @@
+{
+  "name": "Tiny Tapeout Dev Container",
+  "image": "ghcr.io/kuleuven-micas/tt2026:latest",
+  // "build": {
+  //   "dockerfile": "Containerfile",
+  //   "context": ".."
+  // },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "mshr-h.veriloghdl",
+        "surfer-project.surfer"
+      ]
+    }
+  },
+  "privileged": true,
+  "remoteUser": "root",
+  "postCreateCommand": "git clone --depth 1 https://github.com/TinyTapeout/tt-support-tools tt",
+  "postStartCommand": "/usr/local/share/docker-init.sh"
+}
