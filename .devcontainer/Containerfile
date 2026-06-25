@@ -7,7 +7,7 @@ ENV PDK_ROOT=/ttsetup/pdk
 ENV PDK=sky130A
 
 # LibreLane version — update to match tt-gds-action/action.yml
-ARG LIBRELANE_TAG=3.0.0
+ARG LIBRELANE_TAG=3.0.3
 
 # Activate the Python venv for all shells and processes
 ENV VIRTUAL_ENV=/ttsetup/venv
@@ -31,7 +31,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     /ttsetup/venv/bin/pip install librelane==${LIBRELANE_TAG}
 
 # Verible: Verilog linter and formatter
-RUN curl -L https://github.com/chipsalliance/verible/releases/download/v0.0-4053-g89d4d98a/verible-v0.0-4053-g89d4d98a-linux-static-x86_64.tar.gz | \
+RUN curl -L https://github.com/chipsalliance/verible/releases/download/v0.0-4080-ga0a8d8eb/verible-v0.0-4080-ga0a8d8eb-linux-static-x86_64.tar.gz | \
     tar -xzf - -C /usr/local --strip-components=1
 
 # Setup docker-in-docker
