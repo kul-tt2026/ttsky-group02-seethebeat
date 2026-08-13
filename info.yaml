@@ -1,6 +1,6 @@
 # Tiny Tapeout project information
 project:
-  title:        "SeatTheBeat"      # Project title
+  title:        "SeeTheBeat"      # Project title
   author:       "Jonas Creyns, Giel Swenters"      # Your name
   discord:      ""      # Your discord username, for communication and automatically assigning you a Tapeout role (optional)
   description:  "Real-time audio visualizer: on-chip 512-point FFT driving a VGA display"      # One line description of what your project does
