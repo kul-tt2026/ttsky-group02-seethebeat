@@ -11,6 +11,8 @@ tt_submission
 src/user_config.json
 src/config_merged.json
 test/sim_build
+**/__pycache__/
+*.pyc
 test/__pycache__/
 test/results.xml
 test/gate_level_netlist.v
