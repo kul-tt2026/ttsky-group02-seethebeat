@@ -1,17 +1,17 @@
 # Tiny Tapeout project information
 project:
   title:        "SeatTheBeat"      # Project title
-  author:       "SeatTheBeat"      # Your name
+  author:       "Jonas Creyns, Giel Swenters"      # Your name
   discord:      ""      # Your discord username, for communication and automatically assigning you a Tapeout role (optional)
-  description:  ""      # One line description of what your project does
+  description:  "Real-time audio visualizer: on-chip 512-point FFT driving a VGA display"      # One line description of what your project does
   language:     "Verilog" # other examples include SystemVerilog, Amaranth, VHDL, etc
-  clock_hz:     0       # Clock frequency in Hz (or 0 if not applicable)
+  clock_hz:     40000000       # Clock frequency in Hz (or 0 if not applicable)
 
   # How many tiles your design occupies? A single tile is about 167x108 uM.
   tiles: "2x2"          # Valid values: 1x1, 1x2, 2x2, 3x2, 4x2, 6x2 or 8x2
 
   # Your top module name must start with "tt_um_". Make it unique by including your github username:
-  top_module:  "tt_um_seatrhebeat"
+  top_module:  "tt_um_group02_seethebeat"
 
   # List your project's source files here.
   # Source files must be in ./src and you must list each source file separately, one per line.
@@ -22,35 +22,35 @@ project:
 # The pinout of your project. Leave unused pins blank. DO NOT delete or add any pins.
 # This section is for the datasheet/website. Use descriptive names (e.g., RX, TX, MOSI, SCL, SEG_A, etc.).
 pinout:
-  # Inputs
-  ui[0]: ""
-  ui[1]: ""
-  ui[2]: ""
-  ui[3]: ""
-  ui[4]: ""
-  ui[5]: ""
-  ui[6]: ""
-  ui[7]: ""
+  # Inputs -- sample/read date from MCU (RP2040)
+  ui[0]: "din0"
+  ui[1]: "din1"
+  ui[2]: "din2"
+  ui[3]: "din3"
+  ui[4]: "din4"
+  ui[5]: "din5"
+  ui[6]: "din6"
+  ui[7]: "din7"
 
-  # Outputs
-  uo[0]: ""
-  uo[1]: ""
-  uo[2]: ""
-  uo[3]: ""
-  uo[4]: ""
-  uo[5]: ""
-  uo[6]: ""
-  uo[7]: ""
+  # Outputs -- VGA
+  uo[0]: "R1"
+  uo[1]: "G1"
+  uo[2]: "B1"
+  uo[3]: "vsync"
+  uo[4]: "R0"
+  uo[5]: "G0"
+  uo[6]: "B0"
+  uo[7]: "hsync"
 
-  # Bidirectional pins
-  uio[0]: ""
-  uio[1]: ""
-  uio[2]: ""
-  uio[3]: ""
-  uio[4]: ""
-  uio[5]: ""
-  uio[6]: ""
-  uio[7]: ""
+  # Bidirectional pins -- Bus MCU (for commands, read/write data to MCU)
+  uio[0]: "mbus0"
+  uio[1]: "mbus1"
+  uio[2]: "mbus2"
+  uio[3]: "mbus3"
+  uio[4]: "mbus4"
+  uio[5]: "mbus5"
+  uio[6]: "mbus6"
+  uio[7]: "mbus7"
 
 # Do not change!
 yaml_version: 6
