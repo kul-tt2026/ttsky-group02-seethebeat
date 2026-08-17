@@ -1,0 +1,34 @@
+name: lint
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  verilator-lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+
+      - name: Install Verilator
+        run: sudo apt-get update && sudo apt-get install -y verilator
+
+      - name: Lint RTL
+        run: make lint
+
+  golden-model:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Run Python golden-model self-checks
+        run: |
+          python model/test_cordic.py
+          python model/test_fft_ref.py
