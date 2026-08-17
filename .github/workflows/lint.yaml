@@ -28,5 +28,7 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Run FFT golden-model self-checks
-        run: python model/test_fft_ref.py
+      - name: Run Python golden-model self-checks
+        run: |
+          python model/test_cordic.py
+          python model/test_fft_ref.py

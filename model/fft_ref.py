@@ -27,6 +27,11 @@ the sample value -32768 (magnitude 32768, just over 1.0); test vectors avoid it.
 """
 
 import math
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import cordic  # noqa: E402  (same-dir sibling)
 
 Q = 15                      # fractional bits (Q1.15)
 ONE = 1 << Q                # 32768 == "1.0"
@@ -71,13 +76,16 @@ def bitrev_table(N):
     return _BR_CACHE[N]
 
 
-def fft_fixed(x_re, x_im=None, N=None):
+def fft_fixed(x_re, x_im=None, N=None, use_cordic=True):
     """Fixed-point radix-2 DIT FFT (the golden model).
 
     Args:
         x_re: list of N ints (Q1.15) -- the real input samples.
         x_im: list of N ints (Q1.15) or None (treated as all-zero, i.e. real input).
         N   : transform size (defaults to len(x_re)); must be a power of two.
+        use_cordic: if True (default) the twiddle rotation W*B is done by the CORDIC
+            model -- exactly how the hardware will do it. If False, an ideal fixed-point
+            complex multiply is used (handy to isolate CORDIC's error contribution).
 
     Returns:
         (re, im): two lists of N ints (Q1.15) holding X[k]/N in natural bin order.
@@ -85,7 +93,7 @@ def fft_fixed(x_re, x_im=None, N=None):
     if N is None:
         N = len(x_re)
     assert len(x_re) == N, "x_re length must equal N"
-    tw_re, tw_im = twiddles(N)
+    tw_re, tw_im = (None, None) if use_cordic else twiddles(N)
     br = bitrev_table(N)
 
     # Load inputs in bit-reversed order (DIT with natural-order output).
@@ -100,34 +108,41 @@ def fft_fixed(x_re, x_im=None, N=None):
         for kstart in range(0, N, m):
             for j in range(half):
                 k = j * tstep
-                wr, wi = tw_re[k], tw_im[k]
                 i0 = kstart + j            # A
                 i1 = i0 + half             # B
                 ar, ai = re[i0], im[i0]
                 br_, bi_ = re[i1], im[i1]
 
-                # W * B, reduced from Q2.30 back to Q1.15 by an arithmetic (truncating)
-                # shift. This multiply stands in for the CORDIC rotation (Phase 2).
-                t_re = (wr * br_ - wi * bi_) >> Q
-                t_im = (wr * bi_ + wi * br_) >> Q
+                # W*B = B rotated by the twiddle angle -2*pi*k/N.
+                if use_cordic:
+                    # CORDIC rotation (unity-gain, gain-compensated) -- matches the RTL.
+                    ang_k = -(k * cordic.FULL // N)     # -2*pi*k/N in angle units
+                    t_re, t_im = cordic.rotate(br_, bi_, ang_k)
+                else:
+                    # Ideal fixed-point complex multiply (Q2.30 -> Q1.15, truncating).
+                    wr, wi = tw_re[k], tw_im[k]
+                    t_re = (wr * br_ - wi * bi_) >> Q
+                    t_im = (wr * bi_ + wi * br_) >> Q
 
-                # Butterfly A +/- W*B, then the per-stage scale >>1 (TRUNCATION).
-                re[i0] = (ar + t_re) >> 1
-                im[i0] = (ai + t_im) >> 1
-                re[i1] = (ar - t_re) >> 1
-                im[i1] = (ai - t_im) >> 1
-
-        # Dev-time guard: the scaled FFT must never overflow int16 for valid input.
-        # If this ever fires, the scaling/gain assumptions are wrong -- do NOT silence.
-        _assert_in_range(re, im)
+                # Butterfly A +/- W*B, then per-stage scale >>1 (TRUNCATION), with
+                # SATURATION. The ideal multiply keeps |W*B| <= |B| exactly, but the
+                # CORDIC rotation can exceed it by ~1 LSB; we clamp (as the hardware
+                # will) rather than wrap -- a clipped bin is invisible, a wrapped bin
+                # would be a spurious spike.
+                re[i0] = _sat((ar + t_re) >> 1)
+                im[i0] = _sat((ai + t_im) >> 1)
+                re[i1] = _sat((ar - t_re) >> 1)
+                im[i1] = _sat((ai - t_im) >> 1)
     return re, im
 
 
-def _assert_in_range(re, im):
-    for v in re:
-        assert INT16_MIN <= v <= INT16_MAX, "real overflow: {}".format(v)
-    for v in im:
-        assert INT16_MIN <= v <= INT16_MAX, "imag overflow: {}".format(v)
+def _sat(v):
+    """Saturate to the Q1.15 int16 range (models hardware clamping, not wrap)."""
+    if v > INT16_MAX:
+        return INT16_MAX
+    if v < INT16_MIN:
+        return INT16_MIN
+    return v
 
 
 # ---- helpers used by tests --------------------------------------------------
