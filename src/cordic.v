@@ -41,7 +41,9 @@ module cordic #(
   localparam signed [16:0]     INV_K = 17'sd19898;    // Q1.15 gain-compensation (1/K)
 
   localparam [1:0] ST_IDLE = 2'd0, ST_ITER = 2'd1, ST_GAIN = 2'd2;
-  localparam [4:0] ITER_LAST = ITERS - 1;   // last iteration index (5-bit, width-clean)
+  /* verilator lint_off WIDTHTRUNC */
+  localparam [4:0] ITER_LAST = ITERS - 1;   // last iteration index (intentional 5-bit narrow)
+  /* verilator lint_on WIDTHTRUNC */
   reg [1:0]              state;
   reg [4:0]             i;                    // iteration index 0..ITERS
   reg                   mode_reg;
@@ -132,9 +134,10 @@ module cordic #(
           if (i == ITER_LAST) state <= ST_GAIN;
         end
         ST_GAIN: begin
-          // (gx >>> 15) truncated to XYW bits == gx[XYW+14:15]; value provably fits.
-          x_out   <= $signed(gx[XYW+14:15]);
-          y_out   <= $signed(gy[XYW+14:15]);
+          /* verilator lint_off WIDTHTRUNC */
+          x_out   <= gx >>> 15;       // gain comp (x*INV_K)>>15, intentional truncation to XYW
+          y_out   <= gy >>> 15;
+          /* verilator lint_on WIDTHTRUNC */
           ang_out <= z_reg[AW-1:0];   // wrap to [-pi, pi): low AW bits, signed
           done    <= 1'b1;
           state   <= ST_IDLE;
