@@ -11,11 +11,20 @@ endef
 #
 # lint: static RTL checks with Verilator (no PDK needed).
 # Runs inside the tt2026 devcontainer where verilator is installed.
-# Keeps -Wall for discipline; waives only DECLFILENAME (TT puts the tt_um_*
-# module in project.v, so module name != file name is expected).
+# -Wall stays FULLY on, INCLUDING width checks (WIDTHTRUNC/WIDTHEXPAND), so any
+# *unintended* width bug is still caught everywhere in the design. The handful of
+# *intentional* fixed-point truncations (Q1.15 scaling, CORDIC gain-comp, ...) are
+# silenced at the exact line with inline pragmas:
+#     /* verilator lint_off WIDTHTRUNC */  <one deliberate line>  /* verilator lint_on WIDTHTRUNC */
+# Global waivers (kept minimal):
+#   DECLFILENAME           - TT puts the tt_um_* module in project.v (name != file).
+#   MULTITOP  (temporary)  - during development each block (cordic, butterfly, ...) is
+#                            its own top; they unify under tt_um_* at integration.
+#     TODO(integration): once project.v instantiates the whole design (single top),
+#     REMOVE -Wno-MULTITOP so lint again flags any orphaned/forgotten module.
 # ---------------------------------------------------------------------------
 LINT_SOURCES ?= $(wildcard src/*.v)
-LINT_FLAGS   ?= -Wall -Wno-DECLFILENAME
+LINT_FLAGS   ?= -Wall -Wno-DECLFILENAME -Wno-MULTITOP
 
 lint:
 	@command -v verilator >/dev/null 2>&1 || { \
