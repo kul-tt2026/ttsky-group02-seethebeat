@@ -32,3 +32,27 @@ jobs:
         run: |
           python model/test_cordic.py
           python model/test_fft_ref.py
+
+  rtl-unit-tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+
+      - name: Install iverilog
+        run: sudo apt-get update && sudo apt-get install -y iverilog
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install Python packages
+        run: pip install -r test/requirements.txt
+
+      - name: CORDIC RTL vs Python model
+        run: |
+          cd test_units
+          make
+          # make returns success even if the test fails; check results.xml
+          ! grep '<failure' results.xml
