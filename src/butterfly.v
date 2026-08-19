@@ -42,6 +42,7 @@ module butterfly #(
   wire                  c_start = (state == ST_START);
   wire                  c_done;
   wire signed [XYW-1:0] t_re, t_im;
+  wire signed [AW-1:0]  c_ang;   // CORDIC residual angle -- unused in ROTATE mode
 
   cordic #(.DW(DW), .XYW(XYW), .AW(AW)) u_cordic (
       .clk    (clk),
@@ -53,9 +54,12 @@ module butterfly #(
       .ang_in (ang_r),
       .x_out  (t_re),
       .y_out  (t_im),
-      .ang_out(),                // unused in rotate mode
+      .ang_out(c_ang),
       .done   (c_done)
   );
+
+  // ang_out is the ~0 residual angle in ROTATE mode -- intentionally unused
+  wire _unused_ang = &{c_ang, 1'b0};
 
   // ---- butterfly arithmetic (combinational): A +/- t, then >>1 and saturate ----
   localparam integer W = XYW + 1;   // one guard bit for A +/- t before scaling
