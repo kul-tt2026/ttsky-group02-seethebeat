@@ -11,7 +11,8 @@ can read and reason about.
 ## Planned contents (added as we reach each phase — see `../../PART1_FFT_PLAN.md`)
 - `fft_ref.py` — fixed-point radix-2 DIT 512-point FFT mirroring the hardware exactly
   (same widths, Q-format, per-stage scaling, bit-reversal). *Phase 1.*
-- `cordic.py` — bit-accurate CORDIC (rotation + vectoring modes, gain compensation).
+- `cordic.py` — bit-accurate CORDIC (rotation + vectoring modes, **multiplier-free**
+  gain compensation via `SCALE_STEPS` shift-adds + `GUARD` bits — see *Step 2.5*).
   *Phase 2.* Once done, `fft_ref.py` is updated to use it so the golden model matches
   the CORDIC-based hardware.
 - `vectors.py` — test-vector generators (impulse, single tone at a known bin, two-tone,

@@ -16,6 +16,16 @@ Two modes:
     rotate(x, y, angle) -> rotates (x,y) by `angle`  ..... the butterfly's W*B
     vector(x, y)        -> returns (|.|, atan2)      ..... the FFT bin magnitude |X[k]|
 
+GAIN COMPENSATION IS MULTIPLIER-FREE. The CORDIC's processing gain K is
+undone by SCALE_STEPS -- a short chain of `x <- x +/- (x >> p)` scaling iterations whose
+product approximates 1/K -- instead of a Q1.15 multiply by INV_K. In hardware these steps
+reuse the very same adders and shifters as the rotation iterations, so the two constant
+multipliers disappear for the price of a few extra clock cycles (we have cycles in huge
+surplus). Because a chain of shift-adds truncates once per step, the
+datapath carries GUARD extra fractional bits during the whole operation, which also
+protects the 16 rotation iterations -- so this is both smaller AND more accurate than
+the multiply it replaces (~+4..6 dB end-to-end FFT SNR).
+
 Pure standard library so it runs on the host and in the devcontainer. Python's `>>` on a
 negative int is an arithmetic (floor) shift -- exactly the hardware arithmetic shift.
 """
@@ -37,12 +47,45 @@ _K = 1.0
 for _i in range(ITERS):
     _K *= math.sqrt(1.0 + 2.0 ** (-2 * _i))
 GAIN = _K                              # ~1.6468
-INV_K = round((1.0 / _K) * (1 << Q))   # Q1.15 gain-compensation constant
+INV_K = round((1.0 / _K) * (1 << Q))   # Q1.15 1/K -- the exact target, NOT multiplied by
+
+# ---- multiplier-free gain compensation -------------------------------------
+# 1/K is realised as a product of (1 +/- 2**-p) factors, one shift-add each:
+#     (1 - 2^-1)(1 + 2^-2)(1 - 2^-5)(1 + 2^-9)(1 + 2^-10) = 0.60724374
+# vs the exact 1/K = 0.60725294  ->  relative error 1.5e-5, far below one Q1.15 LSB.
+# (p, s): x <- x + s * (x >> p). Exhaustively searched over p in 1..12, 2..5 factors;
+# this is the best 5-factor set. Fewer factors are too coarse (4 -> 4.1 LSB rms error),
+# more factors add truncation faster than they add accuracy.
+SCALE_STEPS = [(1, -1), (2, +1), (5, -1), (9, +1), (10, +1)]
+
+# Extra fractional bits carried through the whole operation so the chained shift-adds
+# (and the rotation iterations) do not lose a bit each. GUARD = 3 keeps the worst-case
+# internal magnitude at 610,504 -> 21 signed bits, inside the RTL's XYW = 22 datapath.
+# GUARD = 4 would need exactly 22 bits, leaving no margin -- do not raise it without
+# widening XYW.
+GUARD = 3
+
+# Achieved compensation factor (for documentation / self-checks).
+SCALE_GAIN = 1.0
+for _p, _s in SCALE_STEPS:
+    SCALE_GAIN *= 1.0 + _s * 2.0 ** -_p
 
 
 def _wrap(z):
     """Wrap an angle (in angle units) into [-pi, pi)."""
     return ((z + HALF) % FULL) - HALF
+
+
+def _compensate(x, y):
+    """Undo the CORDIC gain with shift-adds only, then drop the guard bits.
+
+    Mirrors the RTL's scaling states exactly: one `+/- (v >> p)` per step, each with an
+    arithmetic (floor) shift, then a final arithmetic `>> GUARD`.
+    """
+    for p, s in SCALE_STEPS:
+        x += s * (x >> p)
+        y += s * (y >> p)
+    return x >> GUARD, y >> GUARD
 
 
 def rotate(x0, y0, angle):
@@ -60,14 +103,15 @@ def rotate(x0, y0, angle):
     elif z < -QUART:         # < -90 deg: rotate vector -90, add 90 to z
         x, y = y, -x
         z += QUART
+    x <<= GUARD              # enter the guarded datapath (exact, just a left shift)
+    y <<= GUARD
     for i in range(ITERS):
         d = 1 if z >= 0 else -1        # rotation mode: drive z -> 0
         nx = x - d * (y >> i)
         ny = y + d * (x >> i)
         z -= d * ATAN[i]
         x, y = nx, ny
-    # Gain compensation: multiply by 1/K (Q1.15), truncating arithmetic shift.
-    return (x * INV_K) >> Q, (y * INV_K) >> Q
+    return _compensate(x, y)
 
 
 def vector(x0, y0):
@@ -83,13 +127,16 @@ def vector(x0, y0):
             x, y, z = y, -x, z + QUART     # rotate -90
         else:
             x, y, z = -y, x, z - QUART     # rotate +90
+    x <<= GUARD
+    y <<= GUARD
     for i in range(ITERS):
         d = -1 if y >= 0 else 1            # vectoring mode: drive y -> 0
         nx = x - d * (y >> i)
         ny = y + d * (x >> i)
         z -= d * ATAN[i]
         x, y = nx, ny
-    return (x * INV_K) >> Q, _wrap(z)
+    mag, _ = _compensate(x, y)
+    return mag, _wrap(z)
 
 
 # ---- unit conversions used by callers/tests --------------------------------
