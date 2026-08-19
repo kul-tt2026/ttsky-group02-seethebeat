@@ -31,6 +31,7 @@ jobs:
       - name: Run Python golden-model self-checks
         run: |
           python model/test_cordic.py
+          python model/test_butterfly.py
           python model/test_fft_ref.py
 
   rtl-unit-tests:
@@ -50,9 +51,13 @@ jobs:
       - name: Install Python packages
         run: pip install -r test/requirements.txt
 
-      - name: CORDIC RTL vs Python model
+      - name: RTL blocks vs Python models (bit-exact)
         run: |
           cd test_units
-          make
-          # make returns success even if the test fails; check results.xml
-          ! grep '<failure' results.xml
+          for B in cordic butterfly; do
+            echo "=== unit test: $B ==="
+            make BLOCK=$B
+            # make returns success even if the test fails; check results.xml
+            ! grep '<failure' results.xml
+            make clean BLOCK=$B
+          done

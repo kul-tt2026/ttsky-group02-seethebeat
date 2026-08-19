@@ -11,6 +11,10 @@ TOPLEVEL_LANG  ?= verilog
 BLOCK          ?= cordic
 
 VERILOG_SOURCES = $(PWD)/../src/$(BLOCK).v
+# blocks that instantiate submodules must list them here too:
+ifeq ($(BLOCK),butterfly)
+VERILOG_SOURCES += $(PWD)/../src/cordic.v
+endif
 TOPLEVEL        = $(BLOCK)
 COCOTB_TEST_MODULES = test_$(BLOCK)
 
