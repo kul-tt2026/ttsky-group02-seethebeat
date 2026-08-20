@@ -33,6 +33,7 @@ jobs:
           python model/test_cordic.py
           python model/test_butterfly.py
           python model/test_fft_ref.py
+          python model/test_mcu_bus_model.py
 
   rtl-unit-tests:
     runs-on: ubuntu-24.04
@@ -54,7 +55,7 @@ jobs:
       - name: RTL blocks vs Python models (bit-exact)
         run: |
           cd test_units
-          for B in cordic butterfly; do
+          for B in cordic butterfly mcu_bus; do
             echo "=== unit test: $B ==="
             make BLOCK=$B
             # make returns success even if the test fails; check results.xml

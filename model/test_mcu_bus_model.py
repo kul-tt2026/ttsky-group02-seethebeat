@@ -1,0 +1,151 @@
+"""
+test_mcu_bus_model.py -- self-checks for the bus golden model.
+
+    python model/test_mcu_bus_model.py     # standalone, prints a report
+    pytest model/                          # as unit tests
+
+Checks the exact transfer bit-packing, that a write->read round-trip through the
+cycle-stepped MCUSlave returns the same data for any address / value / MCU latency, and
+that PIPELINED burst reads return the right words in order (proving the full-duplex
+overlap of command issue and response streaming).
+"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import mcu_bus_model as bus   # noqa: E402
+
+
+def _pattern(addr):
+    """Deterministic 16-bit value per address (no RNG needed)."""
+    return (addr * 40503 + 0x1234) & 0xFFFF
+
+
+def test_encode_read_bits():
+    # addr=165=0b0_1010_0101 -> addr[8:5]=0b0101=5, addr[4:0]=0b00101=5
+    assert bus.encode_read(165) == [0x15, 0x0A], bus.encode_read(165)
+
+
+def test_encode_write_bits():
+    # addr=165, data=0xBEEF -> T2=101111, T3=101110, T4={1111,00}
+    assert bus.encode_write(165, 0xBEEF) == [0x25, 0x0A, 47, 46, 60], \
+        bus.encode_write(165, 0xBEEF)
+
+
+def test_encode_decode_consistent():
+    """Feeding encode_write's own transfers into the slave must store `data`."""
+    for addr in (0, 1, 255, 256, 511):
+        for data in (0x0000, 0xFFFF, 0x8000, 0x7FFF, 0xA5A5):
+            s = bus.MCUSlave(latency=0)
+            bus.drive_write(s, addr, data)
+            assert s.sram[addr] == data, (addr, data, s.sram.get(addr))
+
+
+def test_roundtrip_all_latencies():
+    """Write a whole pattern, read it back (single reads) -- for several MCU latencies."""
+    for lat in (0, 1, 2, 5, 13):
+        s = bus.MCUSlave(latency=lat)
+        addrs = list(range(0, 512, 7)) + [0, 1, 510, 511]
+        for a in addrs:
+            bus.drive_write(s, a, _pattern(a))
+        for a in addrs:
+            got = bus.drive_read(s, a)
+            assert got == _pattern(a), \
+                "lat={} addr={}: got {:#06x} exp {:#06x}".format(lat, a, got, _pattern(a))
+
+
+def test_burst_read_inorder():
+    """Pipelined burst returns the requested words in order, for several latencies."""
+    for lat in (0, 1, 2, 4, 9):
+        s = bus.MCUSlave(latency=lat)
+        for a in range(512):
+            bus.drive_write(s, a, _pattern(a))
+        # walk the address space in bursts of MAX_OUTSTANDING
+        k = bus.MAX_OUTSTANDING
+        for base in range(0, 512, k):
+            addrs = list(range(base, min(base + k, 512)))
+            got = bus.drive_burst_read(s, addrs)
+            exp = [_pattern(a) for a in addrs]
+            assert got == exp, "lat={} base={}: got {} exp {}".format(lat, base, got, exp)
+
+
+def test_burst_matches_single():
+    """A burst of the SAME addresses gives identical data to reading them one-by-one."""
+    s = bus.MCUSlave(latency=3)
+    addrs = [500, 3, 511, 128]                 # arbitrary order, 4 = MAX_OUTSTANDING
+    for a in addrs:
+        bus.drive_write(s, a, _pattern(a ^ 0x55))
+    single = [bus.drive_read(s, a) for a in addrs]
+    burst = bus.drive_burst_read(s, addrs)
+    assert burst == single, (burst, single)
+
+
+def test_burst_butterfly_shape():
+    """The real access pattern: 4 reads (A_re,A_im,B_re,B_im) as one pipelined burst."""
+    s = bus.MCUSlave(latency=2)
+    a_re, a_im, b_re, b_im = 10, 11, 266, 267   # A at k, B at k+stride
+    vals = {a_re: 0x1111, a_im: 0x2222, b_re: 0x3333, b_im: 0x4444}
+    for addr, v in vals.items():
+        bus.drive_write(s, addr, v)
+    got = bus.drive_burst_read(s, [a_re, a_im, b_re, b_im])
+    assert got == [0x1111, 0x2222, 0x3333, 0x4444], got
+
+
+def test_overwrite():
+    s = bus.MCUSlave(latency=2)
+    bus.drive_write(s, 300, 0x1111)
+    bus.drive_write(s, 300, 0x2222)
+    assert bus.drive_read(s, 300) == 0x2222
+
+
+def test_unwritten_reads_zero():
+    s = bus.MCUSlave(latency=1)
+    assert bus.drive_read(s, 42) == 0x0000
+
+
+def test_max_outstanding_guard():
+    s = bus.MCUSlave(latency=1)
+    try:
+        bus.drive_burst_read(s, list(range(bus.MAX_OUTSTANDING + 1)))
+    except ValueError:
+        return
+    raise AssertionError("burst over MAX_OUTSTANDING should raise")
+
+
+def test_nop_between_transactions():
+    """Idle NOPs must not corrupt framing between back-to-back transactions."""
+    s = bus.MCUSlave(latency=2)
+    bus.drive_write(s, 7, 0xCAFE)
+    for _ in range(5):
+        s.step(bus.NOP)
+    bus.drive_write(s, 8, 0xF00D)
+    for _ in range(3):
+        s.step(bus.NOP)
+    assert bus.drive_read(s, 7) == 0xCAFE
+    assert bus.drive_read(s, 8) == 0xF00D
+
+
+def _main():
+    checks = [test_encode_read_bits, test_encode_write_bits,
+              test_encode_decode_consistent, test_roundtrip_all_latencies,
+              test_burst_read_inorder, test_burst_matches_single,
+              test_burst_butterfly_shape, test_overwrite, test_unwritten_reads_zero,
+              test_max_outstanding_guard, test_nop_between_transactions]
+    print("SeeTheBeat MCU-bus golden-model self-check")
+    print("-" * 48)
+    ok = 0
+    for c in checks:
+        try:
+            c()
+            print("  PASS  {}".format(c.__name__))
+            ok += 1
+        except AssertionError as e:
+            print("  FAIL  {}  --> {}".format(c.__name__, e))
+    print("-" * 48)
+    print("{}/{} checks passed".format(ok, len(checks)))
+    return 0 if ok == len(checks) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())
