@@ -15,7 +15,7 @@ import sys
 
 import cocotb
 from cocotb.clock import Clock
-from cocotb.triggers import RisingEdge, ClockCycles, Timer
+from cocotb.triggers import RisingEdge, ClockCycles, Timer, ReadOnly
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "model"))
 import mcu_bus_model as bus   # noqa: E402
@@ -61,14 +61,15 @@ async def _rd_monitor(dut, out):
 
 
 async def _write(dut, addr, data):
+    # valid/ready handshake: sample accept at end-of-cycle (ReadOnly); the *next* edge,
+    # where req & accept are both high, is the single commit -- avoids a double-commit.
     dut.wr_addr.value = addr
     dut.wr_data.value = data
     dut.wr_req.value = 1
-    while True:
+    await ReadOnly()
+    while int(dut.wr_accept.value) != 1:
         await RisingEdge(dut.clk)
-        await Timer(1, unit="ns")
-        if int(dut.wr_accept.value) == 1:
-            break
+        await ReadOnly()
     await RisingEdge(dut.clk)                      # commit edge
     dut.wr_req.value = 0
     await ClockCycles(dut.clk, 6)                  # let the 5-transfer write drain
@@ -79,12 +80,11 @@ async def _issue_reads(dut, addrs):
     dut.rd_req.value = 1
     for a in addrs:
         dut.rd_addr.value = a
-        while True:
+        await ReadOnly()                          # sample accept before the commit edge
+        while int(dut.rd_accept.value) != 1:
             await RisingEdge(dut.clk)
-            await Timer(1, unit="ns")
-            if int(dut.rd_accept.value) == 1:
-                break
-        await RisingEdge(dut.clk)                  # commit this read
+            await ReadOnly()
+        await RisingEdge(dut.clk)                  # commit this read (exactly once)
     dut.rd_req.value = 0
 
 
