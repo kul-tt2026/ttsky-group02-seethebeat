@@ -24,7 +24,7 @@ OP_RSVD  = 0b11          # reserved: config-read (later extension)
 
 NOP = 0b000000           # idle word driven on uio[5:0]
 
-ADDR_BITS = 9            # 0..511
+ADDR_BITS = 10           # word address 0..1023 (512 complex points x 2 words)
 DATA_BITS = 16
 MAX_OUTSTANDING = 4      # pipelined reads in flight (one butterfly's 4 reads)
 
@@ -35,8 +35,8 @@ MAX_OUTSTANDING = 4      # pipelined reads in flight (one butterfly's 4 reads)
 def encode_read(addr):
     """READ(addr) -> [T0, T1]  (2 transfers)."""
     addr &= (1 << ADDR_BITS) - 1
-    t0 = (OP_READ << 4) | ((addr >> 5) & 0xF)   # {01, addr[8:5]}
-    t1 = ((addr & 0x1F) << 1)                    # {addr[4:0], 0}
+    t0 = (OP_READ << 4) | ((addr >> 6) & 0xF)   # {01, addr[9:6]}
+    t1 = addr & 0x3F                             # addr[5:0]
     return [t0, t1]
 
 
@@ -44,8 +44,8 @@ def encode_write(addr, data):
     """WRITE(addr, data16) -> [T0..T4]  (5 transfers)."""
     addr &= (1 << ADDR_BITS) - 1
     data &= (1 << DATA_BITS) - 1
-    t0 = (OP_WRITE << 4) | ((addr >> 5) & 0xF)   # {10, addr[8:5]}
-    t1 = ((addr & 0x1F) << 1)                    # {addr[4:0], 0}
+    t0 = (OP_WRITE << 4) | ((addr >> 6) & 0xF)   # {10, addr[9:6]}
+    t1 = addr & 0x3F                              # addr[5:0]
     t2 = (data >> 10) & 0x3F                      # data[15:10]
     t3 = (data >> 4) & 0x3F                       # data[9:4]
     t4 = (data & 0xF) << 2                        # {data[3:0], 00}
@@ -112,12 +112,12 @@ class MCUSlave:
                 self.dec = "W1"
             # NOP / reserved -> stay IDLE
         elif d == "R1":
-            self._addr = (self._addr_hi << 5) | (cmd >> 1)
+            self._addr = (self._addr_hi << 6) | (cmd & 0x3F)
             word = self.sram.get(self._addr, 0) & 0xFFFF
             self._respq.append((self._cyc + self.latency, word))
             self.dec = "IDLE"
         elif d == "W1":
-            self._addr = (self._addr_hi << 5) | (cmd >> 1)
+            self._addr = (self._addr_hi << 6) | (cmd & 0x3F)
             self.dec = "WD0"
         elif d == "WD0":
             self._d1510 = cmd & 0x3F
