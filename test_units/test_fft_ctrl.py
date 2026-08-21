@@ -15,6 +15,11 @@ top address bits are never driven (LOGN=6 reaches address 127 only). A bug that 
 address MSB is therefore invisible at small N -- that is a real bug this test once passed
 straight through. CI runs this at FFT_LOGN=9 (the real chip size, addresses 0..1023) as
 well as at the fast default.
+
+Scenarios (review S1/S2/S5): the two-tone case runs at every N (it is the address-coverage
+run); the heavier cases -- full-scale-with-(-32768) for end-to-end saturation, an impulse,
+varied MCU latency, and a stuck-MCU park+reset-recovery -- run only at the fast small N,
+because they exercise control/datapath behaviour that is N-independent.
 """
 
 import math
@@ -35,15 +40,90 @@ def _signed(v):
     return v - 0x10000 if v & 0x8000 else v
 
 
-async def _slave_proc(dut, slave):
-    """Play the MCU memory slave at the pins: sample uio[5:0], step, drive the response."""
+# ---- input builders (Q1.15) ----
+def _twotone(N):
+    return [fft_ref._q15(0.5 * math.cos(2 * math.pi * 3 * n / N)
+                         + 0.25 * math.sin(2 * math.pi * 7 * n / N)) for n in range(N)]
+
+
+def _fullscale(N):
+    # full-amplitude Nyquist square wave, INCLUDING -32768: the widest internal magnitudes,
+    # so the butterfly saturation path actually fires end-to-end (review S2/S5).
+    return [32767 if (n % 2 == 0) else -32768 for n in range(N)]
+
+
+def _impulse(N):
+    x = [0] * N
+    x[0] = 32767
+    return x
+
+
+async def _slave_proc(dut, st):
+    """Play the MCU memory slave at the pins. `st` holds the live slave + a stall flag so
+    scenarios can swap the memory or make the MCU 'go stuck' (stop answering)."""
     while True:
         await RisingEdge(dut.clk)
         await Timer(1, unit="ns")
+        sl = st["slave"]
+        if sl is None or not dut.uio_out.value.is_resolvable:
+            continue
         cmd = int(dut.uio_out.value) & 0x3F
-        rv, b = slave.step(cmd)
+        rv, b = sl.step(cmd)
+        if st["stalled"]:
+            rv, b = 0, 0                          # stuck MCU: withhold resp_valid
         dut.uio_in.value = (rv & 1) << 7
         dut.ui_in.value = b & 0xFF
+
+
+def _load(N, x_re, latency):
+    slave = bus.MCUSlave(latency=latency)
+    br = fft_ref.bitrev_table(N)
+    for i in range(N):
+        slave.sram[2 * i] = x_re[br[i]] & 0xFFFF   # bit-reversed, interleaved 2i/2i+1
+        slave.sram[2 * i + 1] = 0
+    return slave
+
+
+async def _reset(dut):
+    dut.start.value = 0
+    dut.rst_n.value = 0
+    await ClockCycles(dut.clk, 3)
+    dut.rst_n.value = 1
+    await ClockCycles(dut.clk, 2)
+
+
+async def _go(dut):
+    dut.start.value = 1
+    await RisingEdge(dut.clk)
+    dut.start.value = 0
+
+
+async def _wait_done(dut, limit=400000):
+    for _ in range(limit):
+        await RisingEdge(dut.clk)
+        await Timer(1, unit="ns")
+        if int(dut.done.value) == 1:
+            return
+    raise AssertionError("fft_ctrl never asserted done")
+
+
+def _check(slave, x_re, N):
+    re_exp, im_exp = fft_ref.fft_fixed(x_re, N=N)
+    for i in range(N):
+        re_got = _signed(slave.sram.get(2 * i, 0))
+        im_got = _signed(slave.sram.get(2 * i + 1, 0))
+        assert re_got == re_exp[i] and im_got == im_exp[i], (
+            "bin {} mismatch: got ({},{}) exp ({},{})".format(
+                i, re_got, im_got, re_exp[i], im_exp[i]))
+
+
+async def _scenario(dut, st, N, x_re, latency):
+    st["stalled"] = False
+    st["slave"] = _load(N, x_re, latency)
+    await _reset(dut)
+    await _go(dut)
+    await _wait_done(dut)
+    _check(st["slave"], x_re, N)
 
 
 @cocotb.test()
@@ -54,52 +134,30 @@ async def test_fft_ctrl(dut):
         logn = 6
     N = 1 << logn
 
-    # ---- build a structured real input (Q1.15), safely inside [-1, 1) ----
-    x_re = []
-    for n in range(N):
-        v = 0.5 * math.cos(2 * math.pi * 3 * n / N) + 0.25 * math.sin(2 * math.pi * 7 * n / N)
-        x_re.append(fft_ref._q15(v))
-
-    # golden output (uses the CORDIC rotation -- exactly what the RTL computes)
-    re_exp, im_exp = fft_ref.fft_fixed(x_re, N=N)
-
-    # ---- preload MCU memory: bit-reversed input, interleaved (2i=re, 2i+1=im) ----
-    slave = bus.MCUSlave(latency=2)
-    br = fft_ref.bitrev_table(N)
-    for i in range(N):
-        slave.sram[2 * i] = x_re[br[i]] & 0xFFFF
-        slave.sram[2 * i + 1] = 0
-
-    # ---- reset ----
     cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
-    dut.start.value = 0
-    dut.uio_in.value = 0
-    dut.ui_in.value = 0
-    dut.rst_n.value = 0
-    await ClockCycles(dut.clk, 3)
-    dut.rst_n.value = 1
-    await ClockCycles(dut.clk, 2)
+    st = {"slave": None, "stalled": False}
+    cocotb.start_soon(_slave_proc(dut, st))
 
-    cocotb.start_soon(_slave_proc(dut, slave))
+    # two-tone: the address-coverage run, executed at every N (incl. full-size 512).
+    await _scenario(dut, st, N, _twotone(N), latency=2)
 
-    # ---- run one FFT ----
-    dut.start.value = 1
-    await RisingEdge(dut.clk)
-    dut.start.value = 0
+    if N > 128:
+        return  # keep the slow full-size run to one FFT; behaviour cases run at small N
 
-    for _ in range(400000):
-        await RisingEdge(dut.clk)
-        await Timer(1, unit="ns")
-        if int(dut.done.value) == 1:
-            break
-    else:
-        raise AssertionError("fft_ctrl never asserted done")
+    # full-scale (incl. -32768) -> saturation fires end-to-end; also a higher MCU latency
+    await _scenario(dut, st, N, _fullscale(N), latency=5)
+    # impulse (flat spectrum) at zero MCU latency -> varies the handshake timing
+    await _scenario(dut, st, N, _impulse(N), latency=0)
 
-    # ---- read the buffer back and compare bit-exact ----
-    re_got = [_signed(slave.sram.get(2 * i, 0)) for i in range(N)]
-    im_got = [_signed(slave.sram.get(2 * i + 1, 0)) for i in range(N)]
-
-    for i in range(N):
-        assert re_got[i] == re_exp[i] and im_got[i] == im_exp[i], (
-            "bin {} mismatch: got ({},{}) exp ({},{})".format(
-                i, re_got[i], im_got[i], re_exp[i], im_exp[i]))
+    # ---- stuck-MCU park + reset recovery (review S1) ----
+    st["stalled"] = False
+    st["slave"] = _load(N, _twotone(N), latency=2)
+    await _reset(dut)
+    await _go(dut)
+    await ClockCycles(dut.clk, 300)              # run well into the FFT
+    assert int(dut.done.value) == 0, "done asserted far too early"
+    st["stalled"] = True                          # MCU goes stuck mid-transform
+    await ClockCycles(dut.clk, 800)
+    assert int(dut.done.value) == 0, "chip did NOT stall on a stuck MCU (should park)"
+    # recover: reset chip + MCU, reload fresh input, and a clean FFT must complete correctly
+    await _scenario(dut, st, N, _twotone(N), latency=2)

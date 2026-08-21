@@ -71,7 +71,13 @@ async def test_butterfly(dut):
             (-12000, 10000, 7000, -5000),
             (0, 14000, -3000, -11000),
             (32000, 32000, 32000, 32000),      # exercises the saturation path
-            (-32000, 30000, 31000, -29000)]
+            (-32000, 30000, 31000, -29000),
+            # full-scale corners incl. -32768 (widest internal magnitude): a 22-bit RTL
+            # wrap would diverge from the unbounded model here (review S2).
+            (32767, 32767, 32767, 32767),
+            (-32768, -32768, -32768, -32768),
+            (-32768, 32767, -32768, 32767),
+            (32767, -32768, 32767, -32768)]
     for deg in range(-170, 171, 20):
         ang = model_cordic.rad_to_ang(math.radians(deg))
         for (ar, ai, br, bi) in vecs:

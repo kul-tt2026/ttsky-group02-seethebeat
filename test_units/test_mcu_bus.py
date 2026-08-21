@@ -26,7 +26,6 @@ def _pattern(addr):
 
 
 async def _reset(dut):
-    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     dut.rd_req.value = 0
     dut.wr_req.value = 0
     dut.rd_addr.value = 0
@@ -41,10 +40,13 @@ async def _reset(dut):
 
 
 async def _slave_proc(dut, slave):
-    """Play the MCU memory slave: sample uio[5:0], step the model, drive its response."""
+    """Play the MCU memory slave: sample uio[5:0], step the model, drive its response.
+    `slave` is a single object whose .latency the test mutates between latency runs."""
     while True:
         await RisingEdge(dut.clk)
         await Timer(1, unit="ns")                 # let combinational uio_out settle
+        if not dut.uio_out.value.is_resolvable:
+            continue
         cmd = int(dut.uio_out.value) & 0x3F
         rv, b = slave.step(cmd)
         dut.uio_in.value = (rv & 1) << 7          # resp_valid on bit 7
@@ -98,33 +100,53 @@ async def _wait_for(dut, cond, limit=2000):
 
 @cocotb.test()
 async def test_mcu_bus(dut):
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
     slave = bus.MCUSlave(latency=3)
-    await _reset(dut)
     cocotb.start_soon(_slave_proc(dut, slave))
     results = []
     cocotb.start_soon(_rd_monitor(dut, results))
 
     addrs = [5, 700, 1023, 0, 37, 512]            # includes addresses > 511 (10-bit)
 
-    # ---- writes land in the model's SRAM ----
-    for a in addrs:
-        await _write(dut, a, _pattern(a))
-    for a in addrs:
-        assert slave.sram[a] == _pattern(a), \
-            "write addr {}: sram={} exp={}".format(a, slave.sram.get(a), _pattern(a))
+    # Re-run the whole suite at several MCU latencies (review S5: latency was never varied
+    # against the RTL). The handshake must make every latency round-trip identically.
+    for latency in (3, 0, 7):
+        slave.latency = latency
+        slave.reset()
+        await _reset(dut)
 
-    # ---- single reads return the written pattern, in order ----
-    await _issue_reads(dut, addrs)
-    await _wait_for(dut, lambda: len(results) >= len(addrs))
-    exp = [_pattern(a) for a in addrs]
-    assert results[:len(addrs)] == exp, "single reads: got {} exp {}".format(results, exp)
+        # ---- writes land in the model's SRAM ----
+        for a in addrs:
+            await _write(dut, a, _pattern(a))
+        for a in addrs:
+            assert slave.sram[a] == _pattern(a), \
+                "lat={} write addr {}: sram={} exp={}".format(latency, a, slave.sram.get(a), _pattern(a))
 
-    # ---- pipelined burst of 4 (MAX_OUTSTANDING) returns correct words in order ----
-    results.clear()
-    burst = [20, 21, 900, 901]                    # one butterfly's A_re,A_im,B_re,B_im
-    for a in burst:
-        await _write(dut, a, _pattern(a ^ 0x55))
-    await _issue_reads(dut, burst)
-    await _wait_for(dut, lambda: len(results) >= len(burst))
-    exp_b = [_pattern(a ^ 0x55) for a in burst]
-    assert results[:len(burst)] == exp_b, "burst reads: got {} exp {}".format(results, exp_b)
+        # ---- single reads return the written pattern, in order ----
+        results.clear()
+        await _issue_reads(dut, addrs)
+        await _wait_for(dut, lambda: len(results) >= len(addrs))
+        exp = [_pattern(a) for a in addrs]
+        assert results[:len(addrs)] == exp, "lat={} single reads: got {} exp {}".format(latency, results, exp)
+
+        # ---- pipelined burst of 4 (== MAX_OUTSTANDING) returns correct words in order ----
+        results.clear()
+        burst = [20, 21, 900, 901]                # one butterfly's A_re,A_im,B_re,B_im
+        for a in burst:
+            await _write(dut, a, _pattern(a ^ 0x55))
+        await _issue_reads(dut, burst)
+        await _wait_for(dut, lambda: len(results) >= len(burst))
+        exp_b = [_pattern(a ^ 0x55) for a in burst]
+        assert results[:len(burst)] == exp_b, "lat={} burst reads: got {} exp {}".format(latency, results, exp_b)
+
+        # ---- 8 reads = 2x MAX_OUTSTANDING: the master must gate the 5th..8th on rd_accept
+        #      until slots free, and still return all 8 IN ORDER (review S5). A broken cap
+        #      would overflow the slave queue or reorder. High latency stresses the gating.
+        results.clear()
+        big = [700, 12, 900, 3, 1000, 55, 511, 128]
+        for a in big:
+            await _write(dut, a, _pattern(a ^ 0x33))
+        await _issue_reads(dut, big)
+        await _wait_for(dut, lambda: len(results) >= len(big), limit=6000)
+        exp_big = [_pattern(a ^ 0x33) for a in big]
+        assert results[:len(big)] == exp_big, "lat={} 8-read cap: got {} exp {}".format(latency, results, exp_big)
