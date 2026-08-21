@@ -21,7 +21,7 @@
 `default_nettype none
 
 module mcu_bus #(
-    parameter integer AW = 9,     // address width (9 -> 0..511)
+    parameter integer AW = 10,    // word address width (10 -> 0..1023 = 512 complex x2)
     parameter integer DW = 16     // data width (Q1.15 component)
 ) (
     input  wire            clk,
@@ -79,10 +79,10 @@ module mcu_bus #(
   reg [5:0] cmd;
   always @(*) begin
     case (state)
-      S_R0:    cmd = {OP_READ,  addr_r[8:5]};
-      S_R1:    cmd = {addr_r[4:0], 1'b0};
-      S_W0:    cmd = {OP_WRITE, addr_r[8:5]};
-      S_W1:    cmd = {addr_r[4:0], 1'b0};
+      S_R0:    cmd = {OP_READ,  addr_r[9:6]};
+      S_R1:    cmd = addr_r[5:0];
+      S_W0:    cmd = {OP_WRITE, addr_r[9:6]};
+      S_W1:    cmd = addr_r[5:0];
       S_W2:    cmd = data_r[15:10];
       S_W3:    cmd = data_r[9:4];
       S_W4:    cmd = {data_r[3:0], 2'b00};
