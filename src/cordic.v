@@ -68,7 +68,10 @@ module cordic #(
   wire scaling = (state == ST_SCALE);
 
   // sign-extend inputs, then enter the guarded datapath (exact -- just a left shift;
-  // worst-case internal magnitude is 610_504, which needs 21 of the XYW = 22 bits).
+  // worst-case internal magnitude is 610_505, at x_in = y_in = -32768. That needs 21 of
+  // the XYW = 22 bits, so exactly one bit of margin. Verified by exhaustive search over
+  // all 2^20 angles x the four full-scale corners; test_units/test_cordic.py carries
+  // those corners, and they do detect a datapath narrowed to 20 bits.
   wire signed [XYW-1:0] x_ext = {{(XYW-DW){x_in[DW-1]}}, x_in};
   wire signed [XYW-1:0] y_ext = {{(XYW-DW){y_in[DW-1]}}, y_in};
   wire signed [ZW-1:0]  a_ext = {{(ZW-AW){ang_in[AW-1]}}, ang_in};

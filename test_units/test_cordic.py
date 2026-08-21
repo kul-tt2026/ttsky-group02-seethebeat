@@ -67,7 +67,12 @@ async def _run(dut, mode, x, y, ang):
 async def test_rotate(dut):
     """ROTATE mode must match model.rotate() exactly across angles and quadrants."""
     await _reset(dut)
-    vecs = [(20000, 0), (10000, 5000), (-8000, 12000), (-15000, -3000), (0, 18000)]
+    # includes the full-scale corners (esp. -32768): these push the CORDIC to its widest
+    # internal magnitude, so a 22-bit RTL wrap would DIVERGE from the unbounded Python
+    # model right here -- which model-only tests can never catch (review S2).
+    vecs = [(20000, 0), (10000, 5000), (-8000, 12000), (-15000, -3000), (0, 18000),
+            (32767, 32767), (-32768, -32768), (32767, -32768), (-32768, 32767),
+            (-32768, 0), (0, -32768)]
     for deg in range(-170, 171, 10):
         ang = model.rad_to_ang(math.radians(deg))
         for (x, y) in vecs:
@@ -81,7 +86,9 @@ async def test_rotate(dut):
 async def test_vector(dut):
     """VECTOR mode: magnitude and angle must match model.vector() exactly."""
     await _reset(dut)
-    vecs = [(20000, 0), (12000, 12000), (-9000, 15000), (-14000, -8000), (0, -17000), (5000, -5000)]
+    vecs = [(20000, 0), (12000, 12000), (-9000, 15000), (-14000, -8000), (0, -17000),
+            (5000, -5000), (32767, 32767), (-32768, -32768), (32767, -32768),
+            (-32768, 32767), (-32768, 0)]     # + full-scale corners (review S2)
     for (x, y) in vecs:
         xo, _, ao = await _run(dut, 1, x, y, 0)
         mmag, mang = model.vector(x, y)

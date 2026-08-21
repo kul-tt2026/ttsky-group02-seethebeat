@@ -45,6 +45,14 @@ module fft_ctrl #(
   localparam integer N  = (1 << LOGN);
   localparam integer AW = 10;                 // protocol word-address width
 
+  // Build guard: the AW-bit word bus caps the transform at N <= 2^(AW-1), i.e.
+  // LOGN <= AW-1. A larger LOGN would silently alias word addresses (dropped MSBs) with
+  // no lint/sim warning -- the exact failure the bus-width bug had. A constant-true
+  // condition makes this an elaboration error, not a silent wrong chip.
+  initial if (LOGN > AW - 1)
+    $error("fft_ctrl: LOGN=%0d exceeds the %0d-bit word bus (max LOGN=%0d)",
+           LOGN, AW, AW - 1);
+
   // 2^(ANGW-1) = half a circle: the angle step at s=1 (halved per stage from s>=2).
   // Derived from ANGW so it tracks the parameter instead of hard-coding 20'h80000.
   localparam [ANGW-1:0] ANG_STEP0 = {1'b1, {(ANGW-1){1'b0}}};
@@ -87,10 +95,10 @@ module fft_ctrl #(
   reg [AW-1:0] rd_addr_c;
   always @(*) begin
     case (ri)
-      3'd0:    rd_addr_c = {i0[8:0], 1'b0};    // A_re
-      3'd1:    rd_addr_c = {i0[8:0], 1'b1};    // A_im
-      3'd2:    rd_addr_c = {i1[8:0], 1'b0};    // B_re
-      default: rd_addr_c = {i1[8:0], 1'b1};    // B_im
+      3'd0:    rd_addr_c = {i0[AW-2:0], 1'b0};    // A_re
+      3'd1:    rd_addr_c = {i0[AW-2:0], 1'b1};    // A_im
+      3'd2:    rd_addr_c = {i1[AW-2:0], 1'b0};    // B_re
+      default: rd_addr_c = {i1[AW-2:0], 1'b1};    // B_im
     endcase
   end
 
@@ -99,10 +107,10 @@ module fft_ctrl #(
   reg [DW-1:0] wr_data_c;
   always @(*) begin
     case (wi)
-      3'd0:    begin wr_addr_c = {i0[8:0], 1'b0}; wr_data_c = wr_are; end
-      3'd1:    begin wr_addr_c = {i0[8:0], 1'b1}; wr_data_c = wr_aim; end
-      3'd2:    begin wr_addr_c = {i1[8:0], 1'b0}; wr_data_c = wr_bre; end
-      default: begin wr_addr_c = {i1[8:0], 1'b1}; wr_data_c = wr_bim; end
+      3'd0:    begin wr_addr_c = {i0[AW-2:0], 1'b0}; wr_data_c = wr_are; end
+      3'd1:    begin wr_addr_c = {i0[AW-2:0], 1'b1}; wr_data_c = wr_aim; end
+      3'd2:    begin wr_addr_c = {i1[AW-2:0], 1'b0}; wr_data_c = wr_bre; end
+      default: begin wr_addr_c = {i1[AW-2:0], 1'b1}; wr_data_c = wr_bim; end
     endcase
   end
 
