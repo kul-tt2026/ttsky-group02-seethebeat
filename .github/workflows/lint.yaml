@@ -55,10 +55,19 @@ jobs:
       - name: RTL blocks vs Python models (bit-exact)
         run: |
           cd test_units
-          for B in cordic butterfly mcu_bus; do
+          for B in cordic butterfly mcu_bus fft_ctrl; do
             echo "=== unit test: $B ==="
             make BLOCK=$B
             # make returns success even if the test fails; check results.xml
             ! grep '<failure' results.xml
             make clean BLOCK=$B
           done
+
+      - name: Full-size FFT (N=512) -- exercises the whole 10-bit bus address space
+        run: |
+          cd test_units
+          # The LOGN=6 run above never drives addr[9] (word addresses only reach 2N-1),
+          # so a dropped address MSB would pass unnoticed. This run is the real chip size.
+          make BLOCK=fft_ctrl FFT_LOGN=9
+          ! grep '<failure' results.xml
+          make clean BLOCK=fft_ctrl
