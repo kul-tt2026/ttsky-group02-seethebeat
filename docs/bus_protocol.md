@@ -30,13 +30,14 @@ carry no opcode — the slave identifies them by its FSM position within the tra
 | Op           | T0[5:4] | Transfers on `uio[5:0]`                                                                                |
 | ------------ | ------- | ------------------------------------------------------------------------------------------------------ |
 | `NOP`        | `00`    | `000000` — driven whenever the master is idle / waiting.                                               |
-| `READ`       | `01`    | `T0={01, addr[8:5]}`, `T1={addr[4:0], 1'b0}`                                                           |
-| `WRITE`      | `10`    | `T0={10, addr[8:5]}`, `T1={addr[4:0], 1'b0}`, `T2=data[15:10]`, `T3=data[9:4]`, `T4={data[3:0], 2'b0}` |
+| `READ`       | `01`    | `T0={01, addr[9:6]}`, `T1=addr[5:0]`                                                                   |
+| `WRITE`      | `10`    | `T0={10, addr[9:6]}`, `T1=addr[5:0]`, `T2=data[15:10]`, `T3=data[9:4]`, `T4={data[3:0], 2'b0}`         |
 | _(reserved)_ | `11`    | config-read (extension for later if possible); undefined in v1.                                        |
 
-- **Address** is 9 bits (0..511), sized for N = 512 and upgradeable.
+- **Address** is a 10-bit **word** address (0..1023): 512 complex points, interleaved as
+  word `2i` = re[i], word `2i+1` = im[i]. (A 512-point complex buffer is 1024 words.)
 - **Write-data** is 16 bits (one Q1.15 real or imag component).
-- Padding bits (the `1'b0` / `2'b0` above) are driven `0` and ignored by the slave.
+- Padding bits (the `2'b0` in T4) are driven `0` and ignored by the slave.
 
 ## Transaction timing
 

@@ -23,19 +23,19 @@ def _pattern(addr):
 
 
 def test_encode_read_bits():
-    # addr=165=0b0_1010_0101 -> addr[8:5]=0b0101=5, addr[4:0]=0b00101=5
-    assert bus.encode_read(165) == [0x15, 0x0A], bus.encode_read(165)
+    # addr=165=0b00_1010_0101 (10b) -> addr[9:6]=0b0010=2, addr[5:0]=0b100101=37
+    assert bus.encode_read(165) == [0x12, 37], bus.encode_read(165)
 
 
 def test_encode_write_bits():
-    # addr=165, data=0xBEEF -> T2=101111, T3=101110, T4={1111,00}
-    assert bus.encode_write(165, 0xBEEF) == [0x25, 0x0A, 47, 46, 60], \
+    # addr=165 -> T0={10,0010}=0x22, T1=addr[5:0]=37; data=0xBEEF -> T2..T4
+    assert bus.encode_write(165, 0xBEEF) == [0x22, 37, 47, 46, 60], \
         bus.encode_write(165, 0xBEEF)
 
 
 def test_encode_decode_consistent():
     """Feeding encode_write's own transfers into the slave must store `data`."""
-    for addr in (0, 1, 255, 256, 511):
+    for addr in (0, 1, 511, 512, 1000, 1023):
         for data in (0x0000, 0xFFFF, 0x8000, 0x7FFF, 0xA5A5):
             s = bus.MCUSlave(latency=0)
             bus.drive_write(s, addr, data)
@@ -46,7 +46,7 @@ def test_roundtrip_all_latencies():
     """Write a whole pattern, read it back (single reads) -- for several MCU latencies."""
     for lat in (0, 1, 2, 5, 13):
         s = bus.MCUSlave(latency=lat)
-        addrs = list(range(0, 512, 7)) + [0, 1, 510, 511]
+        addrs = list(range(0, 1024, 13)) + [0, 1, 1022, 1023]
         for a in addrs:
             bus.drive_write(s, a, _pattern(a))
         for a in addrs:
@@ -59,12 +59,12 @@ def test_burst_read_inorder():
     """Pipelined burst returns the requested words in order, for several latencies."""
     for lat in (0, 1, 2, 4, 9):
         s = bus.MCUSlave(latency=lat)
-        for a in range(512):
+        for a in range(1024):
             bus.drive_write(s, a, _pattern(a))
         # walk the address space in bursts of MAX_OUTSTANDING
         k = bus.MAX_OUTSTANDING
-        for base in range(0, 512, k):
-            addrs = list(range(base, min(base + k, 512)))
+        for base in range(0, 1024, k):
+            addrs = list(range(base, min(base + k, 1024)))
             got = bus.drive_burst_read(s, addrs)
             exp = [_pattern(a) for a in addrs]
             assert got == exp, "lat={} base={}: got {} exp {}".format(lat, base, got, exp)
@@ -73,7 +73,7 @@ def test_burst_read_inorder():
 def test_burst_matches_single():
     """A burst of the SAME addresses gives identical data to reading them one-by-one."""
     s = bus.MCUSlave(latency=3)
-    addrs = [500, 3, 511, 128]                 # arbitrary order, 4 = MAX_OUTSTANDING
+    addrs = [1000, 3, 1023, 128]               # arbitrary order, 4 = MAX_OUTSTANDING
     for a in addrs:
         bus.drive_write(s, a, _pattern(a ^ 0x55))
     single = [bus.drive_read(s, a) for a in addrs]

@@ -104,7 +104,7 @@ async def test_mcu_bus(dut):
     results = []
     cocotb.start_soon(_rd_monitor(dut, results))
 
-    addrs = [5, 200, 511, 0, 37, 256]
+    addrs = [5, 700, 1023, 0, 37, 512]            # includes addresses > 511 (10-bit)
 
     # ---- writes land in the model's SRAM ----
     for a in addrs:
@@ -121,7 +121,7 @@ async def test_mcu_bus(dut):
 
     # ---- pipelined burst of 4 (MAX_OUTSTANDING) returns correct words in order ----
     results.clear()
-    burst = [10, 11, 266, 267]                    # one butterfly's A_re,A_im,B_re,B_im
+    burst = [20, 21, 900, 901]                    # one butterfly's A_re,A_im,B_re,B_im
     for a in burst:
         await _write(dut, a, _pattern(a ^ 0x55))
     await _issue_reads(dut, burst)
