@@ -60,9 +60,16 @@ SCALE_STEPS = [(1, -1), (2, +1), (5, -1), (9, +1), (10, +1)]
 
 # Extra fractional bits carried through the whole operation so the chained shift-adds
 # (and the rotation iterations) do not lose a bit each. GUARD = 3 keeps the worst-case
-# internal magnitude at 610,504 -> 21 signed bits, inside the RTL's XYW = 22 datapath.
+# internal magnitude at 610,505 (reached at x = y = -32768) -> 21 signed bits, inside the
+# RTL's XYW = 22 datapath, i.e. exactly one bit of margin. Verified by exhaustive search
+# over all 2**20 angles x the four full-scale corners.
 # GUARD = 4 would need exactly 22 bits, leaving no margin -- do not raise it without
 # widening XYW.
+#
+# NOTE this model deliberately uses unbounded Python ints (no masking anywhere), while the
+# RTL registers are XYW bits wide. That asymmetry is what makes the RTL-vs-model bit-exact
+# cocotb test an overflow detector: if the RTL ever wraps, the two diverge. Keep it that
+# way -- masking here would silently destroy that property.
 GUARD = 3
 
 # Achieved compensation factor (for documentation / self-checks).
