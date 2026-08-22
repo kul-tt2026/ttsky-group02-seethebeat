@@ -2,70 +2,51 @@
  * Copyright (c) 2026 Jonas Creyns, Giel Swenters
  * SPDX-License-Identifier: Apache-2.0
  *
- * Per-bin magnitude + log read-out for SeeTheBeat (Phase 6). Given one FFT bin
- * X = re + j*im it produces a small log-magnitude code the visuals map to brightness:
- *   |X| = sqrt(re^2 + im^2)   via the CORDIC in VECTORING mode (exact, gain-compensated)
- *   log = { MSB index , 2 mantissa bits below it }   (a cheap piecewise-linear log2)
+ * Per-bin magnitude + log read-out for SeeTheBeat. CORDIC-LESS core: it drives
+ * the SHARED CORDIC (owned by fft_alu) in VECTOR mode to get |X| = sqrt(re^2+im^2), then
+ * a cheap piecewise-linear log2 = { MSB index , 2 mantissa bits below it }.
  * Bit-exact to model/spectrum_ref.py. Multi-cycle: pulse `start`; `done` pulses when
- * `log_mag` is valid.
- *
- * INTEGRATION NOTE: this instantiates its own CORDIC so it is testable standalone. At
- * top-level integration the FFT (butterfly, ROTATE) and this read-out (VECTORING) run
- * at DIFFERENT times, so they should share ONE physical CORDIC via a mode/operand mux --
- * a second CORDIC would cost more space we do not have. (Deferred to project.v wiring.)
+ * `log_mag` is valid. fft_alu multiplexes the one CORDIC between this and butterfly.
  */
 
 `default_nettype none
 
 module spectrum_mag #(
-    parameter integer DW  = 16,       // Q1.15 bin component
-    parameter integer XYW = 22,       // CORDIC magnitude datapath width
-    parameter integer AW  = 20,       // CORDIC angle width
-    parameter integer LOG_W = 7       // packed log code width = 5-bit MSB index + 2 frac
+    parameter integer DW    = 16,
+    parameter integer AW    = 20,
+    parameter integer XYW   = 22,
+    parameter integer LOG_W = 7      // packed log = {msb[4:0], frac[1:0]}
 ) (
-    input  wire                 clk,
-    input  wire                 rst_n,
-    input  wire                 start,
-    input  wire signed [DW-1:0] re,
-    input  wire signed [DW-1:0] im,
-    output reg  [LOG_W-1:0]     log_mag,   // {msb_index[4:0], frac[1:0]}
-    output reg                  done
+    input  wire                  clk,
+    input  wire                  rst_n,
+    input  wire                  start,
+    input  wire signed [DW-1:0]  re,
+    input  wire signed [DW-1:0]  im,
+    output reg  [LOG_W-1:0]      log_mag,
+    output reg                   done,
+
+    // ---- shared-CORDIC handshake (VECTOR): driven here, muxed/resolved in fft_alu ----
+    output wire                  c_start,
+    output wire signed [DW-1:0]  c_x_in,       // re -> CORDIC x_in
+    output wire signed [DW-1:0]  c_y_in,       // im -> CORDIC y_in
+    output wire signed [AW-1:0]  c_ang_in,     // 0 (CORDIC ignores ang_in in VECTOR mode)
+    input  wire signed [XYW-1:0] c_x_out,      // |X| = CORDIC x_out
+    input  wire                  c_done
 );
 
   localparam [1:0] ST_IDLE = 2'd0, ST_START = 2'd1, ST_WAIT = 2'd2;
   reg [1:0] state;
+  reg signed [DW-1:0] re_r, im_r;
 
-  reg signed [DW-1:0] re_r, im_r;             // held across the multi-cycle CORDIC
+  assign c_start  = (state == ST_START);
+  assign c_x_in   = re_r;
+  assign c_y_in   = im_r;
+  assign c_ang_in = {AW{1'b0}};       // unused by the CORDIC in VECTOR mode
 
-  // ---- shared CORDIC in VECTORING mode: x_out = |X|, angle/ y unused ----
-  wire                  c_start = (state == ST_START);
-  wire                  c_done;
-  wire signed [XYW-1:0] c_x, c_y;
-  wire signed [AW-1:0]  c_ang;
+  // ---- log2 encoder (combinational on the vectoring magnitude) ----
+  wire [XYW-1:0] mag = c_x_out;        // magnitude is non-negative; treat bits as unsigned
 
-  cordic #(.DW(DW), .XYW(XYW), .AW(AW)) u_cordic (
-      .clk    (clk),
-      .rst_n  (rst_n),
-      .start  (c_start),
-      .mode   (1'b1),                          // 1 = VECTOR
-      .x_in   (re_r),
-      .y_in   (im_r),
-      .ang_in ({AW{1'b0}}),
-      .x_out  (c_x),
-      .y_out  (c_y),
-      .ang_out(c_ang),
-      .done   (c_done)
-  );
-
-  // y_out (~0) and ang_out (phase) are not needed for a magnitude read-out
-  wire _unused = &{1'b0, c_y, c_ang};
-
-  // ---- log2 encoder (combinational from the vectoring magnitude) ----
-  // magnitude is non-negative in vector mode; treat the bits as unsigned.
-  wire [XYW-1:0] mag = c_x;
-
-  // priority encoder: index of the most-significant set bit (0 if mag == 0)
-  function [4:0] msb_idx(input [XYW-1:0] v);
+  function [4:0] msb_idx(input [XYW-1:0] v);   // index of the most-significant set bit
     integer i;
     begin
       msb_idx = 5'd0;
@@ -74,39 +55,22 @@ module spectrum_mag #(
     end
   endfunction
 
-  wire [4:0]      msb = msb_idx(mag);
-  // two mantissa bits just below the MSB (bits msb-1, msb-2); none exist for msb < 2.
-  // Indexed part-select grabs exactly those 2 bits (no wide, mostly-unused shift result).
-  wire [4:0]      sh  = (msb >= 5'd2) ? (msb - 5'd2) : 5'd0;
-  wire [1:0]      frac = (msb >= 5'd2) ? mag[sh +: 2] : 2'b00;
-  wire [LOG_W-1:0] log_code = {msb, frac};      // {msb[4:0], frac[1:0]} = (msb<<2)|frac
+  wire [4:0]       msb  = msb_idx(mag);
+  wire [4:0]       sh   = (msb >= 5'd2) ? (msb - 5'd2) : 5'd0;
+  wire [1:0]       frac = (msb >= 5'd2) ? mag[sh +: 2] : 2'b00;   // 2 bits below the MSB
+  wire [LOG_W-1:0] log_code = {msb, frac};
 
   always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
-      state   <= ST_IDLE;
-      done    <= 1'b0;
-      log_mag <= {LOG_W{1'b0}};
-      re_r    <= {DW{1'b0}};
-      im_r    <= {DW{1'b0}};
+      state <= ST_IDLE; done <= 1'b0; log_mag <= {LOG_W{1'b0}};
+      re_r <= 0; im_r <= 0;
     end else begin
       done <= 1'b0;
       case (state)
-        ST_IDLE: begin
-          if (start) begin
-            re_r <= re;
-            im_r <= im;
-            state <= ST_START;
-          end
-        end
-        ST_START: state <= ST_WAIT;             // c_start pulses -> CORDIC latches re/im
-        ST_WAIT: begin
-          if (c_done) begin
-            log_mag <= log_code;
-            done    <= 1'b1;
-            state   <= ST_IDLE;
-          end
-        end
-        default: state <= ST_IDLE;
+        ST_IDLE:  if (start) begin re_r <= re; im_r <= im; state <= ST_START; end
+        ST_START: state <= ST_WAIT;      // c_start pulses -> shared CORDIC latches re/im
+        ST_WAIT:  if (c_done) begin log_mag <= log_code; done <= 1'b1; state <= ST_IDLE; end
+        default:  state <= ST_IDLE;
       endcase
     end
   end
