@@ -38,7 +38,9 @@ module fft_ctrl #(
     input  wire [7:0] ui_in
 );
 
-  localparam [10:0] N  = (1'b1 << LOGN);
+  /* verilator lint_off WIDTHEXPAND */
+  localparam [9:0] N  = (1'b1 << LOGN);
+  /* verilator lint_on WIDTHEXPAND */
   localparam integer AW = 10;                 // protocol word-address width
 
   // Build guard: the AW-bit word bus caps N at 2^(AW-1), i.e. LOGN <= AW-1.
