@@ -38,7 +38,7 @@ module fft_ctrl #(
     input  wire [7:0] ui_in
 );
 
-  localparam [10:0] N  = (11'b1 << LOGN);
+  localparam [10:0] N     = 11'b1 << $unsigned(LOGN);
   localparam integer AW = 10;                 // protocol word-address width
 
   // Build guard: the AW-bit word bus caps N at 2^(AW-1), i.e. LOGN <= AW-1.
@@ -49,8 +49,7 @@ module fft_ctrl #(
   localparam [ANGW-1:0] ANG_STEP0 = {1'b1, {(ANGW-1){1'b0}}};   // 2^(ANGW-1), angle step s=1
   localparam [10:0] N_VAL    = N[10:0];
   localparam [4:0]  LOGN_VAL = LOGN[4:0];
-  localparam [9:0]  NH_M1    = (N / 11'd2) - 11'd1;   // last magnitude bin (N/2 useful bins: 0..N/2-1)
-
+  localparam [9:0]  NH_M1 = N[10:1] - 10'd1;   // last magnitude bin (N/2 useful bins: 0..N/2-1)
   localparam [2:0] S_IDLE=3'd0, S_READ=3'd1, S_COMP=3'd2, S_WRITE=3'd3,
                    S_NEXT=3'd4, S_DONE=3'd5, S_MREAD=3'd6, S_MCOMP=3'd7;
   reg [2:0] state;
