@@ -38,7 +38,7 @@ module fft_ctrl #(
     input  wire [7:0] ui_in
 );
 
-  localparam integer [10:0] N  = (1'b1 << LOGN);
+  localparam integer N  = (1'b1 << LOGN);
   localparam integer AW = 10;                 // protocol word-address width
 
   // Build guard: the AW-bit word bus caps N at 2^(AW-1), i.e. LOGN <= AW-1.
