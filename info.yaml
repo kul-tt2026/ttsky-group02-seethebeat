@@ -19,6 +19,8 @@ project:
   source_files:
     - "cordic.v"
     - "butterfly.v"
+    - "spectrum_mag.v"
+    - "fft_alu.v"
     - "mcu_bus.v"
     - "fft_ctrl.v"
     - "project.v"
