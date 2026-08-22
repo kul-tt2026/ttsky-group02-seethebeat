@@ -33,6 +33,7 @@ from cocotb.triggers import RisingEdge, ClockCycles, Timer
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "model"))
 import mcu_bus_model as bus   # noqa: E402
 import fft_ref                # noqa: E402
+import spectrum_ref           # noqa: E402
 
 
 def _signed(v):
@@ -117,13 +118,35 @@ def _check(slave, x_re, N):
                 i, re_got, im_got, re_exp[i], im_exp[i]))
 
 
+async def _mag_monitor(dut, out):
+    """Capture the magnitude read-out stream (log_mag on each mag_valid)."""
+    while True:
+        await RisingEdge(dut.clk)
+        await Timer(1, unit="ns")
+        v = dut.mag_valid.value
+        if v.is_resolvable and int(v) == 1:
+            out.append(int(dut.mag_data.value))
+
+
+def _expected_mags(x_re, N):
+    """The N/2 log-magnitudes the read-out should emit = log2(|X[k]|) of the FFT output."""
+    re_e, im_e = fft_ref.fft_fixed(x_re, N=N)
+    return [spectrum_ref.log_mag(re_e[k], im_e[k]) for k in range(N // 2)]
+
+
 async def _scenario(dut, st, N, x_re, latency):
     st["stalled"] = False
     st["slave"] = _load(N, x_re, latency)
+    mags = []
+    mon = cocotb.start_soon(_mag_monitor(dut, mags))
     await _reset(dut)
     await _go(dut)
     await _wait_done(dut)
-    _check(st["slave"], x_re, N)
+    _check(st["slave"], x_re, N)                       # FFT buffer bit-exact
+    mon.kill()
+    exp = _expected_mags(x_re, N)                      # magnitude read-out stream bit-exact
+    assert mags == exp, "mag stream mismatch: got {} exp {} (len {} vs {})".format(
+        mags[:8], exp[:8], len(mags), len(exp))
 
 
 @cocotb.test()
