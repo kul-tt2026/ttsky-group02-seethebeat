@@ -15,6 +15,9 @@ VERILOG_SOURCES = $(PWD)/../src/$(BLOCK).v
 ifeq ($(BLOCK),butterfly)
 VERILOG_SOURCES += $(PWD)/../src/cordic.v
 endif
+ifeq ($(BLOCK),spectrum_mag)
+VERILOG_SOURCES += $(PWD)/../src/cordic.v
+endif
 ifeq ($(BLOCK),fft_ctrl)
 VERILOG_SOURCES += $(PWD)/../src/mcu_bus.v $(PWD)/../src/butterfly.v $(PWD)/../src/cordic.v
 # N = 2^FFT_LOGN. Default 6 keeps the full-FFT sim quick for iteration, but note what a
