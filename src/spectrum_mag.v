@@ -75,10 +75,10 @@ module spectrum_mag #(
   endfunction
 
   wire [4:0]      msb = msb_idx(mag);
-  // two mantissa bits just below the MSB (msb-1, msb-2); none exist for msb < 2
+  // two mantissa bits just below the MSB (bits msb-1, msb-2); none exist for msb < 2.
+  // Indexed part-select grabs exactly those 2 bits (no wide, mostly-unused shift result).
   wire [4:0]      sh  = (msb >= 5'd2) ? (msb - 5'd2) : 5'd0;
-  wire [XYW-1:0]  shifted = mag >> sh;
-  wire [1:0]      frac = (msb >= 5'd2) ? shifted[1:0] : 2'b00;
+  wire [1:0]      frac = (msb >= 5'd2) ? mag[sh +: 2] : 2'b00;
   wire [LOG_W-1:0] log_code = {msb, frac};      // {msb[4:0], frac[1:0]} = (msb<<2)|frac
 
   always @(posedge clk or negedge rst_n) begin
