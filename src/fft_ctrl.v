@@ -68,8 +68,8 @@ module fft_ctrl #(
   reg [9:0]  half;          // 2^(s-1)
   reg [10:0] kstart;        // group start (complex index)
   reg [9:0]  j;             // butterfly within group
-  reg [ANGW-1:0] angle_step;    // 2^(ANGW-s)
-  reg [ANGW-1:0] angle_acc;     // -j*angle_step (two's-complement twiddle angle)
+  reg signed [ANGW-1:0] angle_step;    // 2^(ANGW-s)
+  reg signed [ANGW-1:0] angle_acc;     // -j*angle_step (twiddle angle; signed for the CORDIC)
 
   wire [10:0] i0 = kstart + {1'b0, j};        // top complex index
   wire [10:0] i1 = i0 + {1'b0, half};         // bottom complex index
@@ -136,7 +136,7 @@ module fft_ctrl #(
   butterfly #(.DW(DW), .AW(ANGW), .XYW(22)) u_bf (
       .clk(clk), .rst_n(rst_n), .start(bf_start),
       .a_re(a_re), .a_im(a_im), .b_re(b_re), .b_im(b_im),
-      .angle($signed(angle_acc)),
+      .angle(angle_acc),
       .a_re_o(bf_are_o), .a_im_o(bf_aim_o), .b_re_o(bf_bre_o), .b_im_o(bf_bim_o),
       .done(bf_done)
   );
