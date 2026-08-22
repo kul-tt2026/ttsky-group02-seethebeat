@@ -128,18 +128,21 @@ module fft_ctrl #(
       .uio_out(uio_out), .uio_oe(uio_oe), .uio_in(uio_in), .ui_in(ui_in)
   );
 
-  // ---- shared butterfly (A +/- W*B, >>1, saturate) ----
+  // ---- shared CORDIC ALU (op=0 = butterfly here; op=1 magnitude in Phase 7.3) ----
   wire            bf_start = (state == S_COMP) && !bf_started;
   wire            bf_done;
   wire [DW-1:0]   bf_are_o, bf_aim_o, bf_bre_o, bf_bim_o;
+  wire [6:0]      alu_log_mag;        // magnitude out -- unused during the FFT phase
 
-  butterfly #(.DW(DW), .AW(ANGW), .XYW(22)) u_bf (
-      .clk(clk), .rst_n(rst_n), .start(bf_start),
+  fft_alu #(.DW(DW), .AW(ANGW), .XYW(22)) u_alu (
+      .clk(clk), .rst_n(rst_n), .start(bf_start), .op(1'b0),   // op=0 -> butterfly/rotate
       .a_re(a_re), .a_im(a_im), .b_re(b_re), .b_im(b_im),
       .angle(angle_acc),
       .a_re_o(bf_are_o), .a_im_o(bf_aim_o), .b_re_o(bf_bre_o), .b_im_o(bf_bim_o),
+      .log_mag(alu_log_mag),
       .done(bf_done)
   );
+  wire _unused_alu = &{1'b0, alu_log_mag};   // magnitude output not read in the FFT phase
 
   always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
