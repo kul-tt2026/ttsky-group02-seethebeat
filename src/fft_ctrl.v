@@ -3,17 +3,17 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * FFT controller / sequencer for SeeTheBeat -- runs the full N-point radix-2 DIT FFT in
- * place in MCU memory, then a MAGNITUDE READ-OUT phase over the N/2 useful bins. Both
- * phases share the one MCU bus and the one CORDIC ALU (fft_alu), so no arbiter is needed.
- *
- *   FFT phase   (op=0): per butterfly, burst 4 reads (A/B), rotate+add+sat, write 4 back.
- *                       Mirrors model/fft_ref.py exactly (counters s,half,kstart,j;
- *                       twiddle via the angle accumulator angle_acc -= angle_step).
- *   MAG phase   (op=1): per bin k=0..N/2-1, read re@2k & im@2k+1, CORDIC-vector -> log,
- *                       emit on mag_data/mag_valid. Bit-exact to model/spectrum_ref.py.
+ * place in MCU memory. Per butterfly: burst 4 reads (A/B), rotate+add+saturate, write 4
+ * back. Mirrors model/fft_ref.py exactly (counters s,half,kstart,j; twiddle via the angle
+ * accumulator angle_acc -= angle_step, no ROM).
  *
  * Memory: complex point i at word 2i (re) / 2i+1 (im); 10-bit word address. Input must be
  * in MCU memory in BIT-REVERSED order (MCU firmware) before `start`.
+ *
+ * CHANGED 2026-08-25: the magnitude read-out phase (S_MREAD/S_MCOMP + the mbin counter and
+ * the mag_valid/mag_data stream) was REMOVED -- magnitude+log now runs in MCU firmware
+ * against model/spectrum_ref.py. The FFT leaves the transformed buffer in MCU memory, which
+ * is where the MCU wants it anyway; `done` says it is ready to read.
  */
 
 `default_nettype none
@@ -26,10 +26,7 @@ module fft_ctrl #(
     input  wire       clk,
     input  wire       rst_n,
     input  wire       start,          // pulse: begin (data already loaded, bit-reversed)
-    output reg        done,           // 1-cycle pulse when FFT + magnitude read-out finish
-
-    output reg        mag_valid,      // 1-cycle pulse per magnitude bin (MAG phase)
-    output reg [6:0]  mag_data,       // that bin's log-magnitude {msb[4:0], frac[1:0]}
+    output reg        done,           // 1-cycle pulse when the in-place FFT is complete
 
     // pin-side bus to the MCU (see docs/bus_protocol.md)
     output wire [7:0] uio_out,
@@ -38,7 +35,6 @@ module fft_ctrl #(
     input  wire [7:0] ui_in
 );
 
-  localparam [10:0] N     = 11'b1 << $unsigned(LOGN);
   localparam integer AW = 10;                 // protocol word-address width
 
   // Build guard: the AW-bit word bus caps N at 2^(AW-1), i.e. LOGN <= AW-1.
@@ -46,71 +42,91 @@ module fft_ctrl #(
     $error("fft_ctrl: LOGN=%0d exceeds the %0d-bit word bus (max LOGN=%0d)",
            LOGN, AW, AW - 1);
 
-  localparam [ANGW-1:0] ANG_STEP0 = {1'b1, {(ANGW-1){1'b0}}};   // 2^(ANGW-1), angle step s=1
-  localparam [10:0] N_VAL    = N[10:0];
-  localparam [4:0]  LOGN_VAL = LOGN[4:0];
-  localparam [9:0]  NH_M1 = N[10:1] - 10'd1;   // last magnitude bin (N/2 useful bins: 0..N/2-1)
+  // ---- counter widths, sized for the LOGN <= AW-1 = 9 the guard above enforces ----
+  // A complex index is 0..N-1, so IXW bits. The group pointer needs ONE more bit than that,
+  // because its successor next_k must be able to reach N itself (that is what ends a stage).
+  localparam integer IXW = AW - 1;            // 9: complex index / half / j
+  localparam integer KW  = AW;                // 10: group pointer, reaches N
+  localparam integer SW  = 4;                 // stage counter, holds 1..9
+
+  localparam [IXW-1:0]  IX_ONE    = {{(IXW-1){1'b0}}, 1'b1};
+  localparam [SW-1:0]   S_ONE     = {{(SW-1){1'b0}}, 1'b1};
+  localparam [KW-1:0]   N         = {{(KW-1){1'b0}}, 1'b1} << $unsigned(LOGN);
+  localparam [SW-1:0]   LOGN_VAL  = LOGN[SW-1:0];
+  localparam [ANGW-1:0] ANG_STEP0 = {1'b1, {(ANGW-1){1'b0}}};   // 2^(ANGW-1), stage s=1
+
   localparam [2:0] S_IDLE=3'd0, S_READ=3'd1, S_COMP=3'd2, S_WRITE=3'd3,
-                   S_NEXT=3'd4, S_DONE=3'd5, S_MREAD=3'd6, S_MCOMP=3'd7;
+                   S_NEXT=3'd4, S_DONE=3'd5;
   reg [2:0] state;
 
   // ---- FFT loop state (mirrors fft_ref.py) ----
-  reg [4:0]  s;             // stage 1..LOGN
-  reg [9:0]  half;          // 2^(s-1)
-  reg [10:0] kstart;        // group start (complex index)
-  reg [9:0]  j;             // butterfly within group
+  reg [SW-1:0]  s;                     // stage 1..LOGN
+  reg [IXW-1:0] half;                  // 2^(s-1), max 2^(LOGN-1) = 256
+  reg [KW-1:0]  kstart;                // group start (complex index)
+  reg [IXW-1:0] j;                     // butterfly within group, max half-1 = 255
   reg signed [ANGW-1:0] angle_step;    // 2^(ANGW-s)
   reg signed [ANGW-1:0] angle_acc;     // -j*angle_step (twiddle angle; signed for CORDIC)
-  reg [9:0]  mbin;          // magnitude read-out bin counter
 
-  wire [10:0] i0 = kstart + {1'b0, j};
-  wire [10:0] i1 = i0 + {1'b0, half};
-  wire [10:0] mstep = {1'b0, half} << 1;
-  wire [10:0] next_k = kstart + mstep;
+  wire [KW-1:0] i0     = kstart + {1'b0, j};
+  wire [KW-1:0] i1     = i0 + {1'b0, half};
+  wire [KW-1:0] mstep  = {1'b0, half} << 1;
+  wire [KW-1:0] next_k = kstart + mstep;
 
-  wire last_bf    = (j == (half - 10'd1));
-  wire last_group = (next_k == N_VAL);
+  wire last_bf    = (j == (half - IX_ONE));
+  wire last_group = (next_k == N);
   wire last_stage = (s == LOGN_VAL);
-  wire last_mbin  = (mbin == NH_M1);
 
-  // ---- operand / result registers ----
-  reg [DW-1:0] a_re, a_im, b_re, b_im;         // read operands (MAG: bin re/im in b_re/b_im)
-  reg [DW-1:0] wr_are, wr_aim, wr_bre, wr_bim; // butterfly results to write
-  reg [2:0]    ri, rc, wi;                      // read-issue / read-collect / write-issue
+  // ---- operand registers ----
+  reg [DW-1:0] a_re, a_im, b_re, b_im;          // the 4 read operands
+  reg [2:0]    ri, rc, wi;                       // read-issue / read-collect / write-issue
   reg          bf_started;
 
-  // ---- bus master ----
+  // ---- the CORDIC ALU (butterfly + the one CORDIC) ----
+  wire          bf_start = !bf_started && (state == S_COMP);
+  wire          bf_done;
+  wire [DW-1:0] bf_are_o, bf_aim_o, bf_bre_o, bf_bim_o;
+
+  fft_alu #(.DW(DW), .AW(ANGW), .XYW(22)) u_alu (
+      .clk(clk), .rst_n(rst_n), .start(bf_start),
+      .a_re(a_re), .a_im(a_im), .b_re(b_re), .b_im(b_im),
+      .angle(angle_acc),
+      .a_re_o(bf_are_o), .a_im_o(bf_aim_o), .b_re_o(bf_bre_o), .b_im_o(bf_bim_o),
+      .done(bf_done)
+  );
+
+  // ---- bus request muxes ----
   wire            rd_req, rd_accept, rd_valid, wr_req, wr_accept;
   wire [AW-1:0]   rd_addr, wr_addr;
   wire [DW-1:0]   rd_data, wr_data;
 
-  // read address: FFT (S_READ) uses the butterfly pair i0/i1; MAG (S_MREAD) uses bin mbin
   reg [AW-1:0] rd_addr_c;
   always @(*) begin
-    if (state == S_MREAD) begin
-      rd_addr_c = {mbin[AW-2:0], ri[0]};            // 2*mbin (re) / 2*mbin+1 (im)
-    end else begin
-      case (ri)
-        3'd0:    rd_addr_c = {i0[AW-2:0], 1'b0};    // A_re
-        3'd1:    rd_addr_c = {i0[AW-2:0], 1'b1};    // A_im
-        3'd2:    rd_addr_c = {i1[AW-2:0], 1'b0};    // B_re
-        default: rd_addr_c = {i1[AW-2:0], 1'b1};    // B_im
-      endcase
-    end
+    case (ri)
+      3'd0:    rd_addr_c = {i0[IXW-1:0], 1'b0};    // A_re
+      3'd1:    rd_addr_c = {i0[IXW-1:0], 1'b1};    // A_im
+      3'd2:    rd_addr_c = {i1[IXW-1:0], 1'b0};    // B_re
+      default: rd_addr_c = {i1[IXW-1:0], 1'b1};    // B_im
+    endcase
   end
 
+  // The write mux reads the butterfly's OWN output registers directly -- no local copy.
+  // Timing invariant that makes this safe: butterfly writes a_re_o..b_im_o only on its
+  // c_done (in its ST_WAIT) and then parks in ST_IDLE; the next write needs bf_start, which
+  // this FSM cannot re-assert until S_WRITE -> S_NEXT -> S_READ -> S_COMP has run. So the
+  // results are stable for the whole write burst. (Do not re-order those states without
+  // re-checking this.)
   reg [AW-1:0] wr_addr_c;
   reg [DW-1:0] wr_data_c;
   always @(*) begin
     case (wi)
-      3'd0:    begin wr_addr_c = {i0[AW-2:0], 1'b0}; wr_data_c = wr_are; end
-      3'd1:    begin wr_addr_c = {i0[AW-2:0], 1'b1}; wr_data_c = wr_aim; end
-      3'd2:    begin wr_addr_c = {i1[AW-2:0], 1'b0}; wr_data_c = wr_bre; end
-      default: begin wr_addr_c = {i1[AW-2:0], 1'b1}; wr_data_c = wr_bim; end
+      3'd0:    begin wr_addr_c = {i0[IXW-1:0], 1'b0}; wr_data_c = bf_are_o; end
+      3'd1:    begin wr_addr_c = {i0[IXW-1:0], 1'b1}; wr_data_c = bf_aim_o; end
+      3'd2:    begin wr_addr_c = {i1[IXW-1:0], 1'b0}; wr_data_c = bf_bre_o; end
+      default: begin wr_addr_c = {i1[IXW-1:0], 1'b1}; wr_data_c = bf_bim_o; end
     endcase
   end
 
-  assign rd_req  = (state == S_READ  && ri != 3'd4) || (state == S_MREAD && ri != 3'd2);
+  assign rd_req  = (state == S_READ)  && (ri != 3'd4);
   assign rd_addr = rd_addr_c;
   assign wr_req  = (state == S_WRITE) && (wi != 3'd4);
   assign wr_addr = wr_addr_c;
@@ -124,36 +140,20 @@ module fft_ctrl #(
       .uio_out(uio_out), .uio_oe(uio_oe), .uio_in(uio_in), .ui_in(ui_in)
   );
 
-  // ---- shared CORDIC ALU: op=0 butterfly (S_COMP), op=1 magnitude (S_MCOMP) ----
-  wire            alu_op   = (state == S_MCOMP);
-  wire            bf_start = !bf_started && ((state == S_COMP) || (state == S_MCOMP));
-  wire            bf_done;
-  wire [DW-1:0]   bf_are_o, bf_aim_o, bf_bre_o, bf_bim_o;
-  wire [6:0]      alu_log_mag;
-
-  fft_alu #(.DW(DW), .AW(ANGW), .XYW(22)) u_alu (
-      .clk(clk), .rst_n(rst_n), .start(bf_start), .op(alu_op),
-      .a_re(a_re), .a_im(a_im), .b_re(b_re), .b_im(b_im),   // MAG: bin re/im on b_re/b_im
-      .angle(angle_acc),
-      .a_re_o(bf_are_o), .a_im_o(bf_aim_o), .b_re_o(bf_bre_o), .b_im_o(bf_bim_o),
-      .log_mag(alu_log_mag),
-      .done(bf_done)
-  );
-
   always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
-      state <= S_IDLE; done <= 1'b0; mag_valid <= 1'b0; mag_data <= 7'd0;
-      s <= 5'd0; half <= 10'd0; kstart <= 11'd0; j <= 10'd0; mbin <= 10'd0;
+      state <= S_IDLE; done <= 1'b0;
+      s <= {SW{1'b0}}; half <= {IXW{1'b0}}; kstart <= {KW{1'b0}}; j <= {IXW{1'b0}};
       angle_step <= {ANGW{1'b0}}; angle_acc <= {ANGW{1'b0}};
       ri <= 3'd0; rc <= 3'd0; wi <= 3'd0; bf_started <= 1'b0;
       a_re <= 0; a_im <= 0; b_re <= 0; b_im <= 0;
-      wr_are <= 0; wr_aim <= 0; wr_bre <= 0; wr_bim <= 0;
     end else begin
-      done <= 1'b0; mag_valid <= 1'b0;
+      done <= 1'b0;
       case (state)
         S_IDLE: begin
           if (start) begin
-            s <= 5'd1; half <= 10'd1; kstart <= 11'd0; j <= 10'd0;
+            s <= S_ONE; half <= IX_ONE;                // stage 1, half = 1
+            kstart <= {KW{1'b0}}; j <= {IXW{1'b0}};
             angle_step <= ANG_STEP0; angle_acc <= {ANGW{1'b0}};
             ri <= 3'd0; rc <= 3'd0;
             state <= S_READ;
@@ -176,11 +176,8 @@ module fft_ctrl #(
 
         S_COMP: begin
           bf_started <= 1'b1;
-          if (bf_done) begin
-            wr_are <= bf_are_o; wr_aim <= bf_aim_o;
-            wr_bre <= bf_bre_o; wr_bim <= bf_bim_o;
-            wi <= 3'd0; state <= S_WRITE;
-          end
+          // results stay in the butterfly's output registers -- see the write-mux note
+          if (bf_done) begin wi <= 3'd0; state <= S_WRITE; end
         end
 
         S_WRITE: begin
@@ -191,43 +188,23 @@ module fft_ctrl #(
         S_NEXT: begin
           ri <= 3'd0; rc <= 3'd0;
           if (last_bf) begin
-            j <= 10'd0; angle_acc <= {ANGW{1'b0}};
+            j <= {IXW{1'b0}}; angle_acc <= {ANGW{1'b0}};
             if (last_group) begin
-              kstart <= 11'd0;
+              kstart <= {KW{1'b0}};
               if (last_stage) begin
-                mbin <= 10'd0; state <= S_MREAD;    // FFT done -> magnitude read-out
+                state <= S_DONE;                    // FFT complete, buffer left in MCU RAM
               end else begin
-                s <= s + 5'd1; half <= half << 1; angle_step <= angle_step >> 1;
+                s <= s + S_ONE;
+                half <= half << 1; angle_step <= angle_step >> 1;
                 state <= S_READ;
               end
             end else begin
               kstart <= next_k; state <= S_READ;
             end
           end else begin
-            j <= j + 10'd1; angle_acc <= angle_acc - angle_step; state <= S_READ;
-          end
-        end
-
-        // ---- magnitude read-out: read (re,im) of bin mbin, then vector -> log ----
-        S_MREAD: begin
-          if (rd_req && rd_accept) ri <= ri + 3'd1;
-          if (rd_valid) begin
-            if (rc == 3'd0) b_re <= rd_data; else b_im <= rd_data;  // bin re/im -> b_re/b_im
-            rc <= rc + 3'd1;
-          end
-          if (rc == 3'd2) begin bf_started <= 1'b0; state <= S_MCOMP; end
-        end
-
-        S_MCOMP: begin
-          bf_started <= 1'b1;                        // op=1 magnitude; start pulses cycle 1
-          if (bf_done) begin
-            mag_data  <= alu_log_mag;
-            mag_valid <= 1'b1;
-            if (last_mbin) begin
-              state <= S_DONE;
-            end else begin
-              mbin <= mbin + 10'd1; ri <= 3'd0; rc <= 3'd0; state <= S_MREAD;
-            end
+            j <= j + IX_ONE;
+            angle_acc <= angle_acc - angle_step;
+            state <= S_READ;
           end
         end
 
@@ -237,7 +214,8 @@ module fft_ctrl #(
     end
   end
 
-  // high bits always 0 for N<=512; sink for lint
-  wire _unused = &{1'b0, i0[10:9], i1[10:9], next_k[10], mbin[9]};
+  // i0/i1 are complex indices < N <= 2^IXW, so their top bit is always 0 (only
+  // next_k[KW-1] is real -- it is what makes last_group fire at N). Sink for lint.
+  wire _unused = &{1'b0, i0[KW-1], i1[KW-1]};
 
 endmodule
