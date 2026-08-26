@@ -1,12 +1,21 @@
 # SPDX-FileCopyrightText: © 2026 Jonas Creyns, Giel Swenters
 # SPDX-License-Identifier: Apache-2.0
 """
-spectrum_ref.py -- golden model of the Phase 6 magnitude + log read-out.
+spectrum_ref.py -- reference for the magnitude + log step.
+
+*** THIS IS NOW AN MCU-FIRMWARE SPEC, NOT AN RTL SPEC (changed 2026-08-25). ***
+The magnitude read-out was removed from the chip -- sharing the one CORDIC between the
+butterfly and a vectoring magnitude core cost a mux on every CORDIC operand, which pushed
+utilisation to ~80% and broke the GDS render. The MCU already holds the whole spectrum, so
+this step is free there. The RTL that used to implement it is kept, out of the build, at
+src/attic/spectrum_mag.v. This module is what the RP2350 firmware must reproduce; keep its
+self-test (test_spectrum_ref.py) green in CI so the target cannot drift.
 
 For each FFT bin X[k] = re + j*im:
-  * magnitude |X[k]| = sqrt(re^2 + im^2) is computed by the CORDIC in VECTORING mode
-    (model/cordic.py's vector()), EXACTLY as src/spectrum_mag.v does -- so the RTL is
-    bit-exact against this model.
+  * magnitude |X[k]| = sqrt(re^2 + im^2) via the CORDIC in VECTORING mode
+    (model/cordic.py's vector()). Firmware may instead use an exact integer sqrt or
+    max + min/2 -- but then it is no longer bit-exact to this model, so decide which
+    definition is authoritative before writing the band mapping against it.
   * log-magnitude = position of the most-significant set bit + LOG_FRAC mantissa bits
     just below it (a cheap piecewise-linear log2). This is the small value the visuals
     map to brightness; a real logarithm is not needed.
