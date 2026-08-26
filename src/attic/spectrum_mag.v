@@ -2,13 +2,38 @@
  * Copyright (c) 2026 Jonas Creyns, Giel Swenters
  * SPDX-License-Identifier: Apache-2.0
  *
+ * =============================================================================
+ *  ATTIC -- NOT PART OF THE HARDENED DESIGN.
+ *
+ *  This block is deliberately excluded from the chip: it is NOT in info.yaml
+ *  `source_files`, NOT in test/Makefile `PROJECT_SOURCES`, and NOT instantiated
+ *  by project.v. Nothing here reaches silicon. It is kept for reference and for
+ *  the write-up -- a worked example of a CORDIC-vectoring magnitude core with a
+ *  priority-encoder log2 -- and in case area frees up later.
+ *
+ *  WHY IT WAS PULLED (2026-08-25): sharing the one CORDIC between the butterfly
+ *  (ROTATE) and this core (VECTOR) meant a mux on every CORDIC operand input.
+ *  Those muxes drove utilisation to ~80% and the GDS render failed. Magnitude is
+ *  free on the MCU -- it already holds the whole spectrum -- so the function moved
+ *  to firmware. model/spectrum_ref.py is the LIVE reference the firmware must
+ *  match bit-for-bit, and its self-test still runs in CI.
+ *
+ *  TO BRING IT BACK: restore the `op`/`log_mag` mux in src/fft_alu.v and the
+ *  S_MREAD/S_MCOMP phase in src/fft_ctrl.v (both are in git history before
+ *  2026-08-25, along with the op=1 vectors in test_units/test_fft_alu.py and the
+ *  magnitude-stream check in test_units/test_fft_ctrl.py), then re-add the file
+ *  to info.yaml and the Makefiles. Only do this against a real post-harden area
+ *  number.
+ *
+ *  It is still lint-checked -- `make lint-attic` -- so it cannot silently rot.
+ * =============================================================================
+ *
  * Per-bin magnitude + log read-out for SeeTheBeat. CORDIC-LESS core: it drives
  * the SHARED CORDIC (owned by fft_alu) in VECTOR mode to get |X| = sqrt(re^2+im^2), then
  * a cheap piecewise-linear log2 = { MSB index , 2 mantissa bits below it }.
  * Bit-exact to model/spectrum_ref.py. Multi-cycle: pulse `start`; `done` pulses when
  * `log_mag` is valid. fft_alu multiplexes the one CORDIC between this and butterfly.
  */
-
 `default_nettype none
 
 module spectrum_mag #(

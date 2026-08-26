@@ -64,7 +64,6 @@ module mcu_bus #(
 
   reg [2:0]      outstanding;   // reads issued but not yet fully returned
   reg            lo_phase;      // 0 = next resp byte is HI, 1 = LO
-  reg [7:0]      hi_byte;       // captured HI awaiting its LO
 
   wire resp_v     = uio_in[7];
   wire word_done  = resp_v & lo_phase;      // a full 16-bit word completes this cycle
@@ -99,21 +98,24 @@ module mcu_bus #(
       data_r      <= {DW{1'b0}};
       outstanding <= 3'd0;
       lo_phase    <= 1'b0;
-      hi_byte     <= 8'd0;
       rd_data     <= {DW{1'b0}};
       rd_valid    <= 1'b0;
     end else begin
       rd_valid <= 1'b0;
 
       // ---- response engine: pair HI then LO into a word ----
+      // Each byte is written straight into its half of rd_data -- no separate HI staging
+      // register. Between the two halves rd_data holds the new HI over the PREVIOUS word's
+      // LO, which is harmless: rd_valid is low then, and the controller samples rd_data only
+      // on rd_valid, which pulses the cycle after the LO byte lands (both halves current).
       if (resp_v) begin
         if (!lo_phase) begin
-          hi_byte  <= ui_in;
-          lo_phase <= 1'b1;
+          rd_data[DW-1:DW-8] <= ui_in;
+          lo_phase           <= 1'b1;
         end else begin
-          rd_data  <= {hi_byte, ui_in};
-          rd_valid <= 1'b1;
-          lo_phase <= 1'b0;
+          rd_data[DW-9:0] <= ui_in;
+          rd_valid        <= 1'b1;
+          lo_phase        <= 1'b0;
         end
       end
 
