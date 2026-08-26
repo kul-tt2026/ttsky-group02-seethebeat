@@ -20,9 +20,19 @@ signal-processing and video generation; the Tiny Tapeout demo board's microcontr
    lives in the microcontroller's SRAM and the chip ping-pongs data with it on each of
    the 9 FFT stages. The butterfly uses a CORDIC rotator (no multiplier, no twiddle
    ROM); the transform is a scaled fixed-point (Q1.15) radix-2 design.
-3. **Visualization (on chip).** Spectrum magnitudes drive procedural, beat-reactive visuals.
-4. **VGA out.** Pixels are streamed over a Tiny VGA Pmod at 800x600 @ 60 Hz (40 MHz
-   pixel clock), 6-bit color (RRGGBB) plus HSync/VSync.
+3. **Spectrum to visual state (on the microcontroller).** The transform is left in place
+   in the microcontroller's SRAM, so the microcontroller takes it from there: bin
+   magnitude, log scaling, band summing, beat detection and the frequency-zone colour
+   map all run in firmware, where they cost no silicon area.
+4. **Pixels + VGA out (on chip).** Once per frame the chip reads a small visual-state
+   block back from the microcontroller and generates pixels procedurally as
+   f(x, y, time, visual state) -- no frame buffer, no stored objects. Pixels are streamed
+   over a Tiny VGA Pmod at 800x600 @ 60 Hz (40 MHz pixel clock), 6-bit color (RRGGBB)
+   plus HSync/VSync.
+
+The split follows from area: at 2x2 tiles the chip has room for the arithmetic that must
+run at pixel rate, and nothing else. Anything that can be decided once per frame is
+decided in firmware.
 
 ## How to test
 
