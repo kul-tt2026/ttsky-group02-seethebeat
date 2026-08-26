@@ -1,4 +1,4 @@
-.PHONY: harden test test_gates png clean lint
+.PHONY: harden test test_gates png clean lint lint-attic
 
 # Environment variable checks for targets that need the PDK
 define check_env
@@ -23,14 +23,31 @@ endef
 #     TODO(integration): once project.v instantiates the whole design (single top),
 #     REMOVE -Wno-MULTITOP so lint again flags any orphaned/forgotten module.
 # ---------------------------------------------------------------------------
+#
+# src/attic/ is DELIBERATELY excluded from LINT_SOURCES (the `src/*.v` wildcard does not
+# recurse). Those blocks are not part of the hardened design -- see src/attic/*.v -- but they
+# are still linted, separately, by `lint-attic` so they cannot silently rot. Keeping them out
+# of the main lint is what lets the MULTITOP waiver above be removed at integration without a
+# deliberately-orphaned module tripping it.
 LINT_SOURCES ?= $(wildcard src/*.v)
+ATTIC_SOURCES ?= $(wildcard src/attic/*.v)
 LINT_FLAGS   ?= -Wall -Wno-DECLFILENAME -Wno-MULTITOP
 
-lint:
+lint: lint-attic
 	@command -v verilator >/dev/null 2>&1 || { \
 		echo "verilator not found — run this inside the tt2026 devcontainer"; exit 1; }
 	verilator --lint-only $(LINT_FLAGS) $(LINT_SOURCES)
 	@echo "lint: OK"
+
+# Attic blocks are standalone (each is its own top), so they are linted one file at a time.
+lint-attic:
+	@command -v verilator >/dev/null 2>&1 || { \
+		echo "verilator not found — run this inside the tt2026 devcontainer"; exit 1; }
+	@for f in $(ATTIC_SOURCES); do \
+		echo "lint (attic): $$f"; \
+		verilator --lint-only $(LINT_FLAGS) $$f || exit 1; \
+	done
+	@echo "lint-attic: OK"
 
 harden:
 	$(call check_env)
