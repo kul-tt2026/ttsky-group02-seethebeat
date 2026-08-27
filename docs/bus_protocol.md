@@ -171,9 +171,16 @@ capture datapath and simply branch on the opcode when servicing.
 | --- | --- | --- |
 | `0` … `15` | `visual_state` band 0…15 (0 = lowest frequency) | `[4:0]` |
 | `16` | global kick-flash level | `[4:0]` |
-| `17`+ | reserved (the chip ignores them today) | — |
+| `17` | **look config**: `{dim[1:0], palette[1:0], bw}` | `[4:0]` |
+| `18`+ | reserved (the chip ignores them today) | — |
 
-The chip reads all 17 back-to-back at the start of vertical blanking and latches them. The
+**Config word 17 is designed so that ALL-ZERO means "classic look"** — full colour, palette
+0, full brightness. That is a safety property, not a convenience: an unwritten config region
+reads back 0, so firmware that only publishes bands still gets a normal picture. It is why
+brightness is encoded as a *dim* amount rather than a *cap* (a cap of 0 would blank the
+screen on any firmware that forgot to set it).
+
+The chip reads all 18 back-to-back at the start of vertical blanking and latches them. The
 upper bits of each returned word are ignored, so firmware may pack extra information there
 later without a silicon change.
 

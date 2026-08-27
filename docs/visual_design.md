@@ -7,7 +7,7 @@ Keep this file current. When `src/pixel_gen.v`, `src/visual_state.v` or
 `model/visual_ref.py` change, change this too — they are the implementation of what is
 written here, and `model/test_visual_ref.py` is what proves they agree.
 
-*Last updated: 2026-08-27 (geometry rebalance, visual_state refresh path, breathing edge).*
+*Last updated: 2026-08-27 (geometry rebalance, refresh path, breathing edge, look config).*
 
 ---
 
@@ -33,11 +33,12 @@ follows from that.
 | --- | --- | --- | --- | --- |
 | `band[0..15]` | 16 | 5 bits (0–31) | `0`–`15` | energy in that frequency band |
 | `flash` | 1 | 5 bits (0–31) | `16` | global kick-flash level |
+| `cfg` | 1 | 5 bits | `17` | look config: `{dim[1:0], palette[1:0], bw}` |
 
 The chip also keeps an 8-bit **`frame` counter** (not part of `visual_state` — it is
 generated on chip from `frame_start`), which drives the breathing edge in §4.
 
-**85 flip-flops total**, plus a 16:1 read mux. This is the largest single area item in the
+**90 flip-flops total** (16×5 bands + 5 flash + 5 config), plus a 16:1 read mux. This is the largest single area item in the
 visual back-end and the main knob if utilisation gets tight — cost scales directly as
 `NBANDS × BAND_W`.
 
@@ -163,6 +164,83 @@ returned value into `visual_state`.
   each other's data.
 - **If a transform is still running at vblank, the refresh is skipped for that frame** and
   the visuals hold their previous values. At 60 Hz this is imperceptible.
+
+---
+
+## 5b. The look config — three firmware knobs
+
+Config word 17 selects how the chip renders, and **every field is designed so that zero
+means "as before"**:
+
+| Bits | Field | Values |
+| --- | --- | --- |
+| `[0]` | **B&W** | 0 = colour, 1 = greyscale (all three channels driven equally) |
+| `[2:1]` | **palette** | 0 classic (red/magenta/cyan/green), 1 ice, 2 fire, 3 neon |
+| `[4:3]` | **dim** | 0 = full brightness … 3 = black. Applied as the saturation ceiling, so it dims the kick flash too |
+
+**Why dim and not cap:** an unwritten MCU config region reads back 0. Encoding brightness as
+a *cap* would make 0 mean "black screen", so any firmware that forgot the config would ship a
+dead display. As a *dim* amount, 0 means full brightness and the failure mode is benign.
+
+**These are physical-knob ready at zero silicon cost.** A pot → RP2350 ADC → firmware → this
+config word. The chip never knows a knob exists.
+
+Note the wider point about knobs: anything expressible as *"change the numbers the MCU
+publishes"* — sensitivity, attack/decay, beat threshold, bin→band mapping, bass/treble
+balance — is **already free** and needs no config bits at all. Only knobs that change how the
+chip *interprets* the numbers need silicon. Another 5-bit config word costs ~30 GE plus
+whatever logic it gates.
+
+---
+
+## 5c. DESIGN PRINCIPLE — everything should be knob-able
+
+**Decided with Giel, 2026-08-27. Apply this to every visual parameter added from here on.**
+
+When adding a visual parameter, the default assumption is that it should be **live-adjustable
+from a physical knob**, and it needs a reason *not* to be. A DJ visualiser that can only be
+retuned by reflashing firmware is a worse instrument than one with a brightness knob, and on
+this architecture the knob is usually free.
+
+**The chain:** pot → RP2350 ADC → firmware → config word in the MCU's config region → chip
+fetches it in the vblank refresh. **The chip never knows a knob exists.**
+
+### The two classes — check which one a new parameter falls into
+
+| | Cost | Examples |
+| --- | --- | --- |
+| **Free knobs** — expressible as *"change the numbers the MCU publishes"* | **zero silicon, zero config bits** | sensitivity / gain, attack & decay, beat threshold, bin→band mapping, bass/treble balance, freeze, per-band trim |
+| **Silicon knobs** — change how the chip *interprets* the numbers | ~30 GE per 5-bit config word, plus the logic it gates, **and it lands on the `uo_out` critical path** | palette, B&W, brightness cap (all built), effect enables, breathing speed |
+
+Always ask whether a parameter can be moved into the first row. Most can: because the MCU
+computes the band values, anything that is a transform *of those values* is free.
+
+### If the demo board runs short of ADC pins
+
+A pin shortage does **not** have to mean fewer knobs — these are all board/firmware level,
+zero silicon:
+
+- **Analog mux** (e.g. 74HC4051): 8 pots on 1 ADC pin + 3 GPIO.
+- **One pot + a button** that cycles which parameter the pot is editing.
+- **Rotary encoder** on 2 GPIO, no ADC at all.
+
+⚠ **Open question:** how many ADC-capable pins the TT demo board actually leaves free, given
+the RP2350 is already generating the 40 MHz clock and running hard-real-time PIO bus service.
+Confirm this before committing to a knob count.
+
+### Priority order, if we must choose
+
+Should pins genuinely be scarce, add knobs in this order:
+
+1. **Brightness / dim** — the control a DJ reaches for most, because room lighting changes. *(silicon: built)*
+2. **Sensitivity / gain** — essential to adapt to track loudness. *(free)*
+3. **Palette** — the mood control. *(silicon: built)*
+4. **Beat sensitivity** — how hard the kick punches. *(free)*
+5. **B&W** — a switch rather than a pot, so it can use a spare GPIO. *(silicon: built)*
+6. **Effect intensity / enables** — once Phase 5's effects exist. *(silicon: not yet built)*
+
+Note items 2 and 4 need **no silicon at all**, so they should be wired even if the config
+word is full.
 
 ---
 
