@@ -101,6 +101,55 @@ resp_v: 0   0   0   0  1   1   1   1   1   1   1  1
 - The master must drive `NOP` (`000000`) on every idle cycle so the slave in IDLE never
   latches a stale command.
 
+### The idle NOP is load-bearing — do not optimise it away
+
+There is **always at least one NOP cycle before every transaction**: `wr_accept`/`rd_accept`
+require `state == S_IDLE`, and `S_IDLE` drives NOP combinationally, so the earliest a new
+transaction can begin is the cycle *after* an idle cycle. Back-to-back writes are therefore
+`W0 W1 W2 W3 W4 NOP W0 …`, never `…W4 W0…`.
+
+That gap gives the protocol a **self-resynchronising** property, which is the only thing
+standing between a dropped transfer and permanent framing loss:
+
+> If the MCU ever fails to sample one cycle, its FSM is one transfer behind: it has consumed
+> 4 of the master's 5 write transfers and is still waiting for its last payload. It consumes
+> the following NOP as that payload, completes a **corrupted** transaction, and returns to
+> IDLE **realigned with the master**. Damage is bounded to one wrong word — a single garbled
+> frame at 60 Hz — instead of every subsequent transfer being misparsed until reset.
+
+Squeezing the NOP out to gain ~17% write bandwidth would trade a transient glitch for a
+permanent failure. The bus is nowhere near bandwidth-limited (~70k of 663k cycles per frame),
+so there is nothing to gain and a great deal to lose.
+
+## Flow control: what is and isn't handshaked
+
+| Direction | Backpressure |
+| --- | --- |
+| MCU→chip (`ui_in` + `resp_valid`) | **Full handshake.** The master waits indefinitely; no fixed-latency assumption. |
+| chip→MCU (`uio[5:0]`: commands *and* write data) | **None.** The master drives T0…T4 on consecutive cycles and assumes each was sampled. |
+
+**There is no write acknowledgement, deliberately.** The MCU *is* the memory: once a write
+reaches the slave FSM, storing it is a local operation with no medium in between that can
+fail. The only way to lose a write is to miss a sample, and because both ends share one
+clock with no CDC and the slave is a fixed FSM, that is a **timing-budget** property, not a
+reliability one — either the firmware sustains the rate on every cycle or it fails on
+essentially all of them. There is no stochastic middle ground in which a per-write ack would
+tell you anything a bring-up test would not.
+
+**Two caveats the firmware must respect (see `PART3_INTEGRATION_PLAN.md`):**
+
+1. **The clock cannot be used as flow control.** It is tempting to read "the MCU generates
+   the chip clock, so both ends are in lockstep" (top of this file) as "the MCU can always
+   stall the chip by withholding edges". Once Part 2's VGA shares that single clock, it
+   **cannot** — the pixel clock must be a stable 40 MHz or the monitor loses sync. The MCU
+   must therefore service the bus in hard real time. Escape hatches if it cannot: lower the
+   clock, and fall back to 640×480 @ 25.175 MHz.
+2. **Verify the command stream instead of acking it.** The chip's access sequence is fully
+   deterministic and known in advance (2304 butterflies in a fixed order), so the firmware
+   can check that each incoming address is the one it expected next. That catches a dropped
+   transfer *and* a framing desync, costs no pins and no gates, and is strictly stronger
+   than a per-write ack.
+
 ## Config-read (reserved)
 
 Visual config (color/B&W, palette, brightness cap, …) flows MCU→chip. The chip therefore

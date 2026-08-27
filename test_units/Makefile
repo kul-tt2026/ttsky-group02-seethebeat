@@ -11,6 +11,12 @@ TOPLEVEL_LANG  ?= verilog
 BLOCK          ?= cordic
 
 VERILOG_SOURCES = $(PWD)/../src/$(BLOCK).v
+# vga_timing is standalone (pure counters + comparators) -- no extra sources needed.
+# VGA_LINES=<n> walks only the first n lines instead of a whole frame, for fast local
+# iteration: `make BLOCK=vga_timing VGA_LINES=4`. It is exported so cocotb sees it, and
+# the test skips the frame-level checks it then cannot reach. CI always runs the full
+# frame -- the vertical wrap happens exactly ONCE per frame and is invisible below it.
+export VGA_LINES
 # blocks that instantiate submodules must list them here too:
 ifeq ($(BLOCK),fft_alu)
 VERILOG_SOURCES += $(PWD)/../src/butterfly.v $(PWD)/../src/cordic.v
