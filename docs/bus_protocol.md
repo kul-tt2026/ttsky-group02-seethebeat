@@ -32,7 +32,7 @@ carry no opcode — the slave identifies them by its FSM position within the tra
 | `NOP`        | `00`    | `000000` — driven whenever the master is idle / waiting.                                               |
 | `READ`       | `01`    | `T0={01, addr[9:6]}`, `T1=addr[5:0]`                                                                   |
 | `WRITE`      | `10`    | `T0={10, addr[9:6]}`, `T1=addr[5:0]`, `T2=data[15:10]`, `T3=data[9:4]`, `T4={data[3:0], 2'b0}`         |
-| _(reserved)_ | `11`    | config-read (extension for later if possible); undefined in v1.                                        |
+| `CFGRD`      | `11`    | **config-read** (v1, added 2026-08-27): `T0={11, addr[9:6]}`, `T1=addr[5:0]` — identical framing to `READ`, answered from a **separate** address space. |
 
 - **Address** is a 10-bit **word** address (0..1023): 512 complex points, interleaved as
   word `2i` = re[i], word `2i+1` = im[i]. (A 512-point complex buffer is 1024 words.)
@@ -150,10 +150,38 @@ tell you anything a bring-up test would not.
    transfer *and* a framing desync, costs no pins and no gates, and is strictly stronger
    than a per-write ack.
 
-## Config-read (reserved)
+## Config-read (`CFGRD`, opcode `11`) — IMPLEMENTED
 
-Visual config (color/B&W, palette, brightness cap, …) flows MCU→chip. The chip therefore
-**reads** config from a small reserved MCU region (opcode `11`, or normal READs to a
-reserved address range — TBD in future extension maybe) a few times per frame and latches
-on-chip config registers. There is deliberately **no** chip→MCU "config write": the chip
-cannot receive an unsolicited write, only data it asked for.
+Used once per frame by the on-chip `visual_state` refresh.
+
+**Why it needs its own opcode rather than a reserved address range:** a 512-point complex
+buffer is 1024 words, and the address is 10 bits — so `READ`/`WRITE` already address *every*
+word. There is no spare address space to carve out. `CFGRD` therefore selects a **second,
+separate address space** on the MCU side. Address 7 under `CFGRD` and address 7 under `READ`
+are different locations.
+
+**Framing is identical to `READ`** — 2 transfers, same address split, same handshaked
+response on `ui_in`/`resp_valid`, same in-order pipelining and the same
+`MAX_OUTSTANDING = 4`. Only the opcode nibble differs, so the MCU-side PIO can share one
+capture datapath and simply branch on the opcode when servicing.
+
+**The config region layout (v1)** — 17 words, one value per word, low bits only:
+
+| CFG addr | Meaning | Bits used |
+| --- | --- | --- |
+| `0` … `15` | `visual_state` band 0…15 (0 = lowest frequency) | `[4:0]` |
+| `16` | global kick-flash level | `[4:0]` |
+| `17`+ | reserved (the chip ignores them today) | — |
+
+The chip reads all 17 back-to-back at the start of vertical blanking and latches them. The
+upper bits of each returned word are ignored, so firmware may pack extra information there
+later without a silicon change.
+
+**There is deliberately still no chip→MCU "config write":** the chip cannot receive an
+unsolicited write, only data it asked for. Everything flows MCU→chip as a response.
+
+**Ordering rule:** the chip is a single bus master (`fft_ctrl`) and a refresh is only ever
+started from its idle state, so a refresh never interleaves with FFT traffic. This matters
+because responses carry no tags — two interleaved readers would mis-route each other's data.
+If a transform is still running when vblank arrives the refresh is **skipped** for that
+frame and the visuals hold their previous values, which is imperceptible at 60 Hz.
