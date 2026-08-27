@@ -37,6 +37,7 @@ from cocotb.triggers import RisingEdge, ClockCycles, Timer
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "model"))
 import mcu_bus_model as bus   # noqa: E402
 import fft_ref                # noqa: E402
+import visual_ref             # noqa: E402
 
 
 def _signed(v):
@@ -90,6 +91,7 @@ def _load(N, x_re, latency):
 
 async def _reset(dut):
     dut.start.value = 0
+    dut.refresh_req.value = 0
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 3)
     dut.rst_n.value = 1
@@ -165,3 +167,77 @@ async def test_fft_ctrl(dut):
     assert int(dut.done.value) == 0, "chip did NOT stall on a stuck MCU (should park)"
     # recover: reset chip + MCU, reload fresh input, and a clean FFT must complete correctly
     await _scenario(dut, st, N, _twotone(N), latency=2)
+
+
+@cocotb.test()
+async def test_visual_state_refresh(dut):
+    """The once-per-frame visual_state fetch: 17 config-reads, written out in order.
+
+    Three things are worth proving and none are obvious from reading the FSM:
+      1. the values land at addresses 0..16 IN ORDER (mcu_bus responses carry no tags, so
+         the n-th word is only correct because it is the n-th response);
+      2. it reads the CONFIG space, not the FFT buffer -- they share the same 10-bit
+         address numbers and only the opcode separates them;
+      3. a refresh requested while a transform is running is SKIPPED, not interleaved --
+         interleaving would mis-route both readers' data.
+    """
+    logn = 6
+    try:
+        logn = int(dut.LOGN.value)
+    except Exception:
+        pass
+    N = 1 << logn
+
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    st = {"slave": None, "stalled": False}
+    cocotb.start_soon(_slave_proc(dut, st))
+
+    vals = [(i * 3 + 1) & 31 for i in range(16)] + [23]
+
+    for latency in (0, 2, 5):
+        sl = bus.MCUSlave(latency=latency)
+        for a, v in enumerate(vals):
+            sl.cfg[a] = v
+            sl.sram[a] = 0xDEAD                 # must NOT be read by a config fetch
+        st["slave"] = sl
+        st["stalled"] = False
+        await _reset(dut)
+
+        writes = []
+        dut.refresh_req.value = 1
+        await RisingEdge(dut.clk)
+        dut.refresh_req.value = 0
+        for _ in range(3000):
+            await RisingEdge(dut.clk)
+            await Timer(1, unit="ns")
+            if dut.vs_wr_en.value.is_resolvable and int(dut.vs_wr_en.value) == 1:
+                writes.append((int(dut.vs_wr_addr.value), int(dut.vs_wr_data.value)))
+            if len(writes) == 17:
+                break
+
+        assert len(writes) == 17, "latency {}: got {} writes, expected 17".format(
+            latency, len(writes))
+        assert [a for a, _ in writes] == list(range(17)),             "latency {}: addresses out of order: {}".format(latency, [a for a, _ in writes])
+        assert [d for _, d in writes] == vals,             "latency {}: data {} != {}".format(latency, [d for _, d in writes], vals)
+        assert sl.sram[0] == 0xDEAD, "a config fetch must not touch the FFT buffer"
+
+    # ---- a refresh during a transform must be skipped, and must not corrupt the FFT ----
+    x = _twotone(N)
+    st["slave"] = _load(N, x, 2)
+    st["stalled"] = False
+    await _reset(dut)
+    await _go(dut)
+    await ClockCycles(dut.clk, 200)             # well into the transform
+    seen = []
+    dut.refresh_req.value = 1                   # ask for a refresh mid-transform
+    await RisingEdge(dut.clk)
+    dut.refresh_req.value = 0
+    for _ in range(400):
+        await RisingEdge(dut.clk)
+        await Timer(1, unit="ns")
+        if dut.vs_wr_en.value.is_resolvable and int(dut.vs_wr_en.value) == 1:
+            seen.append(int(dut.vs_wr_addr.value))
+    assert seen == [], "refresh ran during a transform (would mis-route bus responses)"
+
+    await _wait_done(dut)
+    _check(st["slave"], x, N)                   # and the FFT result is still bit-exact

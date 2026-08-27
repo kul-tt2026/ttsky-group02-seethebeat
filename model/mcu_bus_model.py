@@ -20,7 +20,9 @@ Pure stdlib so it runs anywhere (host + CI), same as cordic.py / butterfly.py.
 OP_NOP   = 0b00
 OP_READ  = 0b01
 OP_WRITE = 0b10
-OP_RSVD  = 0b11          # reserved: config-read (later extension)
+OP_CFGRD = 0b11          # config-read: same 2-transfer shape as READ, but the
+                         # slave serves it from a SEPARATE region (see cfg below),
+                         # because the FFT buffer already fills all 1024 words.
 
 NOP = 0b000000           # idle word driven on uio[5:0]
 
@@ -38,6 +40,13 @@ def encode_read(addr):
     t0 = (OP_READ << 4) | ((addr >> 6) & 0xF)   # {01, addr[9:6]}
     t1 = addr & 0x3F                             # addr[5:0]
     return [t0, t1]
+
+
+def encode_cfgread(addr):
+    """CFGRD(addr) -> [T0, T1]. Identical framing to READ; only the opcode differs, which
+    is what tells the MCU to answer from the config region instead of the FFT buffer."""
+    addr &= (1 << ADDR_BITS) - 1
+    return [(OP_CFGRD << 4) | ((addr >> 6) & 0xF), addr & 0x3F]
 
 
 def encode_write(addr, data):
@@ -69,7 +78,8 @@ class MCUSlave:
 
     def __init__(self, latency=2):
         self.latency = latency
-        self.sram = {}
+        self.sram = {}      # the FFT working buffer, addressed by READ/WRITE
+        self.cfg = {}       # the config region, addressed by CFGRD -- a SEPARATE space
         self.reset()
 
     def reset(self):
@@ -110,10 +120,18 @@ class MCUSlave:
             elif op == OP_WRITE:
                 self._addr_hi = cmd & 0xF
                 self.dec = "W1"
-            # NOP / reserved -> stay IDLE
+            elif op == OP_CFGRD:
+                self._addr_hi = cmd & 0xF
+                self.dec = "C1"
+            # NOP -> stay IDLE
         elif d == "R1":
             self._addr = (self._addr_hi << 6) | (cmd & 0x3F)
             word = self.sram.get(self._addr, 0) & 0xFFFF
+            self._respq.append((self._cyc + self.latency, word))
+            self.dec = "IDLE"
+        elif d == "C1":
+            self._addr = (self._addr_hi << 6) | (cmd & 0x3F)
+            word = self.cfg.get(self._addr, 0) & 0xFFFF
             self._respq.append((self._cyc + self.latency, word))
             self.dec = "IDLE"
         elif d == "W1":
@@ -146,6 +164,47 @@ def drive_write(slave, addr, data):
 def drive_read(slave, addr, timeout=64):
     """Single (non-pipelined) READ -> 16-bit value."""
     return drive_burst_read(slave, [addr], timeout)[0]
+
+
+def drive_cfgread(slave, addr, timeout=64):
+    """Single config-read: same shape as drive_read, opcode 11."""
+    cmd_stream = encode_cfgread(addr)
+    got, ci = [], 0
+    for _ in range(timeout):
+        cmd = cmd_stream[ci] if ci < len(cmd_stream) else NOP
+        rv, b = slave.step(cmd)
+        if ci < len(cmd_stream):
+            ci += 1
+        if rv:
+            got.append(b)
+            if len(got) == 2:
+                return (got[0] << 8) | got[1]
+    raise TimeoutError("cfgread of {} never returned".format(addr))
+
+
+def drive_burst_cfgread(slave, addrs, timeout=8192):
+    """
+    Streamed config-read of arbitrarily many addresses, throttled to MAX_OUTSTANDING reads
+    in flight -- exactly what the on-chip refresh path does for the 17 visual_state words.
+    Responses are strictly in order, so the n-th word answers the n-th command.
+    """
+    got, issued, done, pend = [], 0, 0, []
+    for _ in range(timeout):
+        cmd = NOP
+        if pend:
+            cmd = pend.pop(0)
+        elif issued < len(addrs) and (issued - done) < MAX_OUTSTANDING:
+            t0, t1 = encode_cfgread(addrs[issued])
+            cmd, pend = t0, [t1]
+            issued += 1
+        rv, b = slave.step(cmd)
+        if rv:
+            got.append(b)
+            if len(got) % 2 == 0:
+                done += 1
+                if done == len(addrs):
+                    return [(got[2 * i] << 8) | got[2 * i + 1] for i in range(len(addrs))]
+    raise TimeoutError("burst cfgread incomplete: {}/{} words".format(done, len(addrs)))
 
 
 def drive_burst_read(slave, addrs, timeout=4096):

@@ -30,6 +30,7 @@ module mcu_bus #(
     // ---- controller (chip) side ----
     input  wire            rd_req,     // request a read of rd_addr
     input  wire [AW-1:0]   rd_addr,
+    input  wire            rd_cfg,     // 1 = serve this read from the CONFIG region (op 11)
     output wire            rd_accept,   // high when a read request is taken this cycle
     output reg  [DW-1:0]   rd_data,     // returned word (in issue order)
     output reg             rd_valid,    // 1-cycle pulse when rd_data is valid
@@ -49,6 +50,11 @@ module mcu_bus #(
   // ---- opcodes (top 2 bits of transfer T0); NOP=00 is the cmd-mux default ----
   localparam [1:0] OP_READ  = 2'b01;
   localparam [1:0] OP_WRITE = 2'b10;
+  // Config-read: framed exactly like READ (2 transfers, same address split) -- only the
+  // opcode differs, which is what tells the MCU to answer from the config region instead
+  // of the FFT buffer. It needs its own space because the 512-point buffer already fills
+  // all 1024 words. Used by the once-per-frame visual_state refresh.
+  localparam [1:0] OP_CFGRD = 2'b11;
 
   // ---- max outstanding reads: MUST match MAX_OUTSTANDING in model/mcu_bus_model.py ----
   localparam [2:0] MAX_OUT = 3'd4;
@@ -61,6 +67,7 @@ module mcu_bus #(
   reg [2:0]      state;
   reg [AW-1:0]   addr_r;
   reg [DW-1:0]   data_r;
+  reg            cfg_r;         // latched with the address: which space this read targets
 
   reg [2:0]      outstanding;   // reads issued but not yet fully returned
   reg            lo_phase;      // 0 = next resp byte is HI, 1 = LO
@@ -78,7 +85,7 @@ module mcu_bus #(
   reg [5:0] cmd;
   always @(*) begin
     case (state)
-      S_R0:    cmd = {OP_READ,  addr_r[9:6]};
+      S_R0:    cmd = {(cfg_r ? OP_CFGRD : OP_READ), addr_r[9:6]};
       S_R1:    cmd = addr_r[5:0];
       S_W0:    cmd = {OP_WRITE, addr_r[9:6]};
       S_W1:    cmd = addr_r[5:0];
@@ -96,6 +103,7 @@ module mcu_bus #(
       state       <= S_IDLE;
       addr_r      <= {AW{1'b0}};
       data_r      <= {DW{1'b0}};
+      cfg_r       <= 1'b0;
       outstanding <= 3'd0;
       lo_phase    <= 1'b0;
       rd_data     <= {DW{1'b0}};
@@ -132,6 +140,7 @@ module mcu_bus #(
             state  <= S_W0;
           end else if (rd_req && rd_accept) begin
             addr_r <= rd_addr;
+            cfg_r  <= rd_cfg;
             state  <= S_R0;
           end
         end

@@ -27,6 +27,7 @@ def _pattern(addr):
 
 async def _reset(dut):
     dut.rd_req.value = 0
+    dut.rd_cfg.value = 0
     dut.wr_req.value = 0
     dut.rd_addr.value = 0
     dut.wr_addr.value = 0
@@ -150,3 +151,39 @@ async def test_mcu_bus(dut):
         await _wait_for(dut, lambda: len(results) >= len(big), limit=6000)
         exp_big = [_pattern(a ^ 0x33) for a in big]
         assert results[:len(big)] == exp_big, "lat={} 8-read cap: got {} exp {}".format(latency, results, exp_big)
+
+
+@cocotb.test()
+async def test_config_read_opcode(dut):
+    """`rd_cfg` must change ONLY the opcode nibble -- config-read is framed exactly like a
+    normal read (2 transfers, same address split), because the MCU-side PIO shares one
+    datapath for both. It exists at all because the 512-point FFT buffer already fills all
+    1024 words, so visual_state needs a separate address space.
+
+    Each address is issued BOTH ways and compared against the model, so a swapped opcode
+    cannot pass. Reset between issues keeps the outstanding-read bookkeeping clean.
+    """
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+
+    for addr in (0, 1, 16, 63, 64, 512, 1023):
+        for cfg in (0, 1):
+            await _reset(dut)
+            dut.rd_cfg.value = cfg
+            dut.rd_addr.value = addr
+            dut.rd_req.value = 1
+
+            got = []
+            for _ in range(40):
+                await RisingEdge(dut.clk)
+                await Timer(1, unit="ns")
+                if len(got) < 2 and int(dut.rd_accept.value) == 0:
+                    got.append(int(dut.uio_out.value) & 0x3F)
+                    if len(got) == 1:
+                        dut.rd_req.value = 0
+                elif len(got) == 2:
+                    break
+            exp = bus.encode_cfgread(addr) if cfg else bus.encode_read(addr)
+            assert got == exp, "addr={} cfg={}: rtl={} model={}".format(addr, cfg, got, exp)
+            assert (got[0] >> 4) == (0b11 if cfg else 0b01), "opcode nibble wrong"
+
+    dut.rd_cfg.value = 0

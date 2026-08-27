@@ -22,6 +22,9 @@ project:
     - "fft_alu.v"
     - "mcu_bus.v"
     - "fft_ctrl.v"
+    - "vga_timing.v"
+    - "visual_state.v"
+    - "pixel_gen.v"
     - "project.v"
 
 # The pinout of your project. Leave unused pins blank. DO NOT delete or add any pins.

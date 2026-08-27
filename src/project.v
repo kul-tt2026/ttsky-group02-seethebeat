@@ -2,23 +2,25 @@
  * Copyright (c) 2026 Jonas Creyns, Giel Swenters
  * SPDX-License-Identifier: Apache-2.0
  *
- * SeeTheBeat top level (Part 1: the FFT engine).
+ * SeeTheBeat top level -- FFT engine + VGA visual back-end.
  *
- * Wires the FFT engine (fft_ctrl = mcu_bus + fft_alu[butterfly + the one CORDIC]) to the pins:
  *   - ui_in[7:0]  : 8-bit read-data from the MCU (into the bus)
  *   - uio[7:0]    : the MCU bus -- uio[5:0] cmd (out), uio[7]=resp_valid, uio[6]=frame-ready
- *   - uo_out[7:0] : RESERVED FOR VGA (Part 2). Part 1 uses uo_out[0] as a bring-up flag.
+ *   - uo_out[7:0] : VGA via the Tiny VGA Pmod -- {hsync, B0,G0,R0, vsync, B1,G1,R1}
  *
- * On the rising edge of frame-ready the chip runs a 512-point FFT in place in MCU SRAM
- * (ping-ponging over the bus) and pulses done. The transformed buffer is left where the MCU
- * wants it -- in its own memory -- and the MCU takes it from there: magnitude, log, band
- * summing, zone/colour mapping and beat detection all run in firmware
- * (model/spectrum_ref.py is the bit-exact reference for the magnitude+log step).
+ * TWO INDEPENDENT LOOPS SHARE ONE BUS:
+ *   1. On the rising edge of frame-ready the chip runs a 512-point FFT in place in MCU SRAM
+ *      and pulses done. The transform is left where the MCU wants it -- in its own memory --
+ *      and firmware takes it from there: magnitude, log, band summing, beat detection and
+ *      the zone colour map all run on the MCU, where they cost no silicon.
+ *   2. Once per frame, at the start of vblank, the chip fetches the 17-word `visual_state`
+ *      block (16 bands + flash) back from the MCU's config region and latches it. Updating
+ *      only during blanking is what stops a bar changing height halfway down the screen.
  *
- * Part 2 replaces uo_out with the VGA pixel stream, generated on chip as f(x, y, time,
- * visual_state) where visual_state is a small per-frame block the chip READS from a reserved
- * MCU region. Only the per-pixel arithmetic stays in silicon; every decision stays in
- * firmware, where it is free.
+ * Both loops are driven by fft_ctrl, which is the chip's single bus master -- see the note
+ * there for why there is no arbiter. Pixels are then generated procedurally as
+ * f(px, py, visual_state): no frame buffer, no stored objects.
+ * See docs/visual_design.md for the full visual specification.
  */
 
 `default_nettype none
@@ -42,29 +44,68 @@ module tt_um_group02_seethebeat (
   end
   wire start = ena & uio_in[6] & ~mcu_status_d;     // 1-cycle pulse (ignored unless idle)
 
-  // ---- FFT engine ----
-  wire       fft_done;
+  // ---- VGA output path ----
+  // vga_timing owns the beam position; pixel_gen is pure f(px, py, visual_state).
+  wire [10:0] px;
+  wire [9:0]  py;
+  wire        active, hsync, vsync, vblank, frame_start;
+  wire [1:0]  vga_r, vga_g, vga_b;
+  wire [3:0]  zone;
+  wire [4:0]  band, flash;
+
+  vga_timing u_vga (
+      .clk(clk), .rst_n(rst_n),
+      .px(px), .py(py), .active(active),
+      .hsync(hsync), .vsync(vsync),
+      .vblank(vblank), .frame_start(frame_start)
+  );
+
+  // The only visual state on the chip. Its power-on defaults draw a readable picture
+  // before any firmware exists, so the output path can be validated on a monitor with
+  // nothing else connected. Refreshed once per frame, in vblank: `frame_start` asks the bus master to fetch the
+  // 17 words (16 bands + flash) from the MCU's config region. Updating only during
+  // blanking is what keeps a bar from changing height halfway down the screen.
+  visual_state u_vs (
+      .clk(clk), .rst_n(rst_n),
+      .wr_en(vs_wr_en), .wr_addr(vs_wr_addr), .wr_data(vs_wr_data),
+      .rd_zone(zone), .band(band), .flash(flash)
+  );
+
+  // Combinational chain, no loop: pixel_gen decodes (px,py) -> zone, visual_state muxes
+  // zone -> band, pixel_gen turns band -> colour. All inside one pixel clock.
+  pixel_gen u_pix (
+      .px(px), .py(py), .active(active),
+      .zone(zone), .band(band), .flash(flash),
+      .r(vga_r), .g(vga_g), .b(vga_b)
+  );
+
+  // ---- FFT engine, and the chip's single MCU-bus master ----
+  // It owns the bus for both jobs -- the transform and the once-per-frame visual_state
+  // refresh -- which is why no arbiter exists: mcu_bus returns responses strictly in order
+  // with no tags, so two interleaved masters would mis-route each other's data.
+  wire       fft_done, fft_busy;
   wire [7:0] fft_uio_out, fft_uio_oe;
+  wire       vs_wr_en;
+  wire [4:0] vs_wr_addr, vs_wr_data;
 
   fft_ctrl #(.LOGN(9)) u_fft (
       .clk(clk), .rst_n(rst_n), .start(start), .done(fft_done),
+      .refresh_req(frame_start),
+      .vs_wr_en(vs_wr_en), .vs_wr_addr(vs_wr_addr), .vs_wr_data(vs_wr_data),
+      .busy(fft_busy),
       .uio_out(fft_uio_out), .uio_oe(fft_uio_oe), .uio_in(uio_in), .ui_in(ui_in)
   );
 
   assign uio_out = fft_uio_out;
   assign uio_oe  = fft_uio_oe;
 
-  // ---- uo_out: reserved for the VGA pixel stream (Part 2) ----
-  // Until then one bit earns its keep for bring-up: fft_ready goes high when a transform
-  // completes and clears when the next one starts, so a scope or the MCU can see the engine
-  // turn over without decoding the bus. fft_ctrl's `done` is a single-cycle pulse; this
-  // latches it into a level.
-  reg fft_ready;
-  always @(posedge clk or negedge rst_n) begin
-    if (!rst_n)        fft_ready <= 1'b0;
-    else if (start)    fft_ready <= 1'b0;
-    else if (fft_done) fft_ready <= 1'b1;
-  end
-  assign uo_out = {7'b0000000, fft_ready};
+  // Tiny VGA Pmod packing: uo_out = {hsync, B0, G0, R0, vsync, B1, G1, R1}.
+  // The pin NAMES are the trap -- the pin labelled R1 carries r[1], the MSB.
+  assign uo_out = {hsync, vga_b[0], vga_g[0], vga_r[0],
+                   vsync, vga_b[1], vga_g[1], vga_r[1]};
+
+  // `vblank` is available for a future effect; `fft_done`/`busy` are observable on the bus
+  // (the MCU knows when it last asserted frame-ready). Sink them for lint.
+  wire _unused = &{1'b0, fft_done, fft_busy, vblank};
 
 endmodule

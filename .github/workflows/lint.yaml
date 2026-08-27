@@ -36,6 +36,8 @@ jobs:
           python model/test_mcu_bus_model.py
           python model/test_spectrum_ref.py
           python model/test_vga_ref.py
+          python model/test_visual_ref.py
+          python model/test_geometry_sync.py
 
   rtl-unit-tests:
     runs-on: ubuntu-24.04
@@ -57,7 +59,7 @@ jobs:
       - name: RTL blocks vs Python models (bit-exact)
         run: |
           cd test_units
-          for B in cordic mcu_bus fft_ctrl fft_alu vga_timing; do
+          for B in cordic mcu_bus fft_ctrl fft_alu vga_timing visual_state pixel_gen; do
             echo "=== unit test: $B ==="
             make BLOCK=$B
             # make returns success even if the test fails; check results.xml
