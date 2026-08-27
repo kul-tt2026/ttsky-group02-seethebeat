@@ -29,12 +29,13 @@ ALL_OFF = [0] * V.NBANDS
 ALL_FULL = [V.BAND_MAX] * V.NBANDS
 
 
-async def _check(dut, px, py, active, bands, flash):
+async def _check(dut, px, py, active, bands, flash, frame=0):
     """Drive a pixel through the real zone->band->colour chain and compare to the model."""
     dut.px.value = px
     dut.py.value = py
     dut.active.value = 1 if active else 0
     dut.flash.value = flash
+    dut.frame.value = frame
     await Timer(1, unit="ns")
 
     z = int(dut.zone.value)
@@ -46,9 +47,9 @@ async def _check(dut, px, py, active, bands, flash):
     await Timer(1, unit="ns")
 
     got = (int(dut.r.value), int(dut.g.value), int(dut.b.value))
-    exp = V.pixel(px, py, active, bands, flash) if active else (0, 0, 0)
-    assert got == exp, "({},{}) act={} flash={}: rtl={} model={}".format(
-        px, py, active, flash, got, exp)
+    exp = V.pixel(px, py, active, bands, flash, frame) if active else (0, 0, 0)
+    assert got == exp, "({},{}) act={} flash={} frame={}: rtl={} model={}".format(
+        px, py, active, flash, frame, got, exp)
 
 
 @cocotb.test()
@@ -147,3 +148,40 @@ async def test_strided_sweep(dut):
             await _check(dut, px, py, True, bands, 3)
             n += 1
     dut._log.info("strided sweep: %d points, all bit-exact", n)
+
+
+@cocotb.test()
+async def test_breathing_edge_across_frames(dut):
+    """The Phase 1 animation: the fill threshold gains a time-varying offset, so a bar's tip
+    drifts in and out. Walk a full breathing cycle at the bar edge, where the effect lives.
+    """
+    bands = [8] * V.NBANDS
+    for frame in range(0, 1 << V.FRAME_W, 5):
+        base = 8 * V.MUL_BASS
+        for depth in (base - 1, base, base + V.WOBBLE_MAX,
+                      base + V.WOBBLE_MAX + 1, base + 2):
+            if 0 <= depth < VV - V.BOTTOM_TOP:
+                await _check(dut, 100, VV - 1 - depth, True, bands, 0, frame)
+
+
+@cocotb.test()
+async def test_silence_stays_black_at_every_frame(dut):
+    """The invariant the wobble could most easily break: it may extend a lit bar but must
+    never light a silent one, or the screen shimmers through quiet passages."""
+    for frame in range(0, 1 << V.FRAME_W, 11):
+        for (px, py) in [(100, VV - 1), (100, VV - 60), (0, 0), (60, 200),
+                         (400, 0), (400, 200), (799, 100), (260, 5)]:
+            await _check(dut, px, py, True, ALL_OFF, 0, frame)
+            assert (int(dut.r.value), int(dut.g.value),
+                    int(dut.b.value)) == (0, 0, 0), (
+                "silence lit up at frame {} ({},{})".format(frame, px, py))
+
+
+@cocotb.test()
+async def test_frame_zero_is_the_unanimated_picture(dut):
+    """wobble(0) == 0 by construction, so a frame-0 render must equal the static design --
+    which is what every other test in this file assumes when it omits `frame`."""
+    bands = V.DEFAULT_BANDS
+    for py in range(0, VV, 37):
+        for px in range(0, H, 41):
+            await _check(dut, px, py, True, bands, 0, 0)

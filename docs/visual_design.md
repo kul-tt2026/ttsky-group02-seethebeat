@@ -7,7 +7,7 @@ Keep this file current. When `src/pixel_gen.v`, `src/visual_state.v` or
 `model/visual_ref.py` change, change this too — they are the implementation of what is
 written here, and `model/test_visual_ref.py` is what proves they agree.
 
-*Last updated: 2026-08-27 (geometry rebalance + visual_state refresh path).*
+*Last updated: 2026-08-27 (geometry rebalance, visual_state refresh path, breathing edge).*
 
 ---
 
@@ -33,6 +33,9 @@ follows from that.
 | --- | --- | --- | --- | --- |
 | `band[0..15]` | 16 | 5 bits (0–31) | `0`–`15` | energy in that frequency band |
 | `flash` | 1 | 5 bits (0–31) | `16` | global kick-flash level |
+
+The chip also keeps an 8-bit **`frame` counter** (not part of `visual_state` — it is
+generated on chip from `frame_start`), which drives the breathing edge in §4.
 
 **85 flip-flops total**, plus a 16:1 read mux. This is the largest single area item in the
 visual back-end and the main knob if utilisation gets tight — cost scales directly as
@@ -120,7 +123,24 @@ For each pixel, in one clock:
 6. **Kick flash** — the top 2 bits of `flash` are added to all three channels and
    **saturated**, never wrapped. A wrapped flash would read as a black frame exactly on the
    beat, the worst possible artefact.
-7. **Blanking gate** — outside the visible area the output is forced to black. Light in the
+7. **Breathing edge (animation).** The fill threshold gains a small time-varying offset
+   so a bar's tip drifts in and out instead of sitting still between beats:
+
+   - `frame` is an 8-bit counter incremented once per `frame_start`; it wraps every 256
+     frames (~4.3 s at 60 Hz). It is the **only** clock a stateless renderer has — nothing
+     can animate by being remembered, because nothing can be stored.
+   - `wobble = triangle(frame)`, ranging 0–7 px, one full breath per wrap.
+   - **A triangle, not a sine, by necessity.** The CORDIC is iterative — 21 clocks per
+     result — while the renderer needs a value *every pixel clock*, so a per-pixel sine is
+     impossible by construction. A triangle off the counter's own bits costs a handful of
+     gates and is indistinguishable once it drives a soft edge.
+   - **A silent band stays perfectly black.** The wobble may only extend a bar that is
+     already lit (`fill = 0 if band == 0`). Without that guard the whole screen would
+     shimmer faintly through quiet passages — the opposite of the mostly-black look.
+   - `wobble(0) == 0`, so a frame-0 render is exactly the un-animated picture. Every static
+     test relies on this.
+
+8. **Blanking gate** — outside the visible area the output is forced to black. Light in the
    porches makes a monitor refuse to lock or shift the image sideways.
 
 **Output packing** (Tiny VGA Pmod): `uo_out = {hsync, B0, G0, R0, vsync, B1, G1, R1}`.
@@ -153,6 +173,7 @@ returned value into `visual_state`.
 - Zone **geometry**: which pixels belong to each zone, cell sizes, fill directions, `MUL`.
 - Zone **hue** — the bottom strip is red, permanently.
 - The brightness curve (top 2 bits, floored at 1) and flash saturation.
+- The breathing effect: its triangle shape, 0–7 px amplitude and ~4.3 s period.
 - `visual_state`'s **shape**: 16 bands × 5 bits + 5-bit flash, and its CFG address map.
 - VGA mode (800×600, all porches, both sync polarities) and the Pmod pin packing.
 - FFT size (512 points) and the bus protocol.

@@ -53,6 +53,16 @@ module tt_um_group02_seethebeat (
   wire [3:0]  zone;
   wire [4:0]  band, flash;
 
+  // ---- the animation clock ----
+  // 800x600 pixels cannot be stored, so nothing animates by being remembered. The only
+  // clock a stateless renderer has is this counter, and every effect must be a function of
+  // (position, time, energy). It wraps every 256 frames (~4.3 s at 60 Hz).
+  reg [7:0] frame;
+  always @(posedge clk or negedge rst_n) begin
+    if (!rst_n)          frame <= 8'd0;
+    else if (frame_start) frame <= frame + 8'd1;
+  end
+
   vga_timing u_vga (
       .clk(clk), .rst_n(rst_n),
       .px(px), .py(py), .active(active),
@@ -75,7 +85,7 @@ module tt_um_group02_seethebeat (
   // zone -> band, pixel_gen turns band -> colour. All inside one pixel clock.
   pixel_gen u_pix (
       .px(px), .py(py), .active(active),
-      .zone(zone), .band(band), .flash(flash),
+      .zone(zone), .band(band), .flash(flash), .frame(frame),
       .r(vga_r), .g(vga_g), .b(vga_b)
   );
 

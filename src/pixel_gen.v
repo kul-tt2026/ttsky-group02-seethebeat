@@ -49,6 +49,8 @@ module pixel_gen #(
     parameter FLASH_W = 5,
     parameter PXW     = 11,           // width of px (vga_timing's HW)
     parameter PYW     = 10,           // width of py (vga_timing's VW)
+    parameter FRAME_W = 8,            // frame-counter width (wraps every 256 frames)
+    parameter WOBBLE_MAX = 7,         // peak extra fill from the breathing effect, px
     // ---- DERIVED -- do not override ----
     parameter integer ZW = $clog2(NBANDS)
 ) (
@@ -59,6 +61,7 @@ module pixel_gen #(
     output wire [ZW-1:0]       zone,        // -> visual_state.rd_zone
     input  wire [BAND_W-1:0]   band,        // <- visual_state.band (for `zone`)
     input  wire [FLASH_W-1:0]  flash,
+    input  wire [FRAME_W-1:0]  frame,       // increments once per frame: the animation clock
 
     output wire [1:0]          r,
     output wire [1:0]          g,
@@ -124,9 +127,28 @@ module pixel_gen #(
   //      no multiplier.
   wire [PXW-1:0] base  = {{(PXW-BAND_W-2){1'b0}}, band, 2'b00};   // band * 4
   wire [PXW-1:0] base2 = {base[PXW-2:0], 1'b0};                    // band * 8
-  wire [PXW-1:0] fill  = in_bottom ? base2           :             // bass   x8
-                         in_centre ? (base2 + base)  :             // centre x12
-                                     base;                         // wings  x4
+  wire [PXW-1:0] fill_raw = in_bottom ? base2           :          // bass   x8
+                            in_centre ? (base2 + base)  :          // centre x12
+                                        base;                      // wings  x4
+
+  // ---- breathing edge (Phase 1.2 / 5.2): a small time-varying offset on the fill
+  //      threshold, so each bar's tip drifts in and out by a few pixels instead of sitting
+  //      still between beats.
+  //
+  //      A TRIANGLE, not a sine, and deliberately so: the CORDIC is iterative (21 clocks
+  //      per result) while the renderer needs a value EVERY pixel clock, so a per-pixel
+  //      sine is impossible by construction. A triangle off the counter's own bits costs a
+  //      few gates and is indistinguishable once it drives a soft edge.
+  wire [5:0] phase = frame[FRAME_W-1:2];                    // advance every 4 frames
+  wire [4:0] tri   = phase[5] ? (5'd31 - phase[4:0]) : phase[4:0];
+  wire [2:0] wob   = tri[4:2];                              // 0..7, wob == 0 at frame 0
+
+  // A SILENT band must stay perfectly black: the wobble may only extend a bar that is
+  // already lit, never light one that should be dark. Without this guard the whole screen
+  // would shimmer faintly through quiet passages -- the opposite of the mostly-black look.
+  wire silent = (band == {BAND_W{1'b0}});
+  wire [PXW-1:0] fill = silent ? {PXW{1'b0}}
+                               : (fill_raw + {{(PXW-3){1'b0}}, wob});
 
   wire lit = (depth < fill);
 

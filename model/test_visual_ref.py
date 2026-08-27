@@ -152,6 +152,59 @@ def test_pmod_packing_bit_positions():
     assert V.pack_pmod(1, 1, 3, 3, 3) == 0xFF
 
 
+def test_wobble_is_a_bounded_triangle():
+    vals = [V.wobble(f) for f in range(1 << V.FRAME_W)]
+    assert V.wobble(0) == 0, "frame 0 must be the un-animated picture"
+    assert min(vals) == 0 and max(vals) == V.WOBBLE_MAX, (min(vals), max(vals))
+    # rises then falls, never jumps by more than 1 -- a jump would read as a stutter
+    for a, b in zip(vals, vals[1:]):
+        assert abs(a - b) <= 1, "wobble jumps from {} to {}".format(a, b)
+    assert vals[:len(vals)//2] != vals[len(vals)//2:], "wobble must actually vary"
+
+
+def test_silence_stays_black_at_every_frame():
+    """The one that matters: the wobble may extend a lit bar but must never light a silent
+    one. If it could, the screen would shimmer during quiet passages -- the exact opposite
+    of the mostly-black look."""
+    for frame in range(0, 1 << V.FRAME_W, 7):
+        for py in range(0, V.V_VIS, 29):
+            for px in range(0, V.H_VIS, 37):
+                assert V.pixel(px, py, True, ALL_OFF, 0, frame) == (0, 0, 0), (px, py, frame)
+
+
+def test_animation_actually_moves():
+    """A lit bar's length must change across a breathing cycle, or the effect is dead code."""
+    bands = list(ALL_OFF)
+    bands[0] = 8                                  # one bass zone, mid level
+    lengths = set()
+    for frame in range(0, 1 << V.FRAME_W, 4):
+        lit = sum(1 for py in range(V.BOTTOM_TOP, V.V_VIS)
+                  if V.pixel(100, py, True, bands, 0, frame) != (0, 0, 0))
+        lengths.add(lit)
+    assert len(lengths) > 1, "bar length never changes -- the wobble does nothing"
+    assert max(lengths) - min(lengths) == V.WOBBLE_MAX,         "bar should breathe by exactly WOBBLE_MAX px, got {}".format(
+            max(lengths) - min(lengths))
+
+
+def test_render_is_deterministic():
+    """Same inputs -> same pixels. A stateless renderer must have no hidden history."""
+    bands = V.DEFAULT_BANDS
+    for frame in (0, 37, 128, 255):
+        a = [V.pixel(px, py, True, bands, 3, frame)
+             for py in range(0, V.V_VIS, 61) for px in range(0, V.H_VIS, 71)]
+        b = [V.pixel(px, py, True, bands, 3, frame)
+             for py in range(0, V.V_VIS, 61) for px in range(0, V.H_VIS, 71)]
+        assert a == b, "frame {} rendered differently twice".format(frame)
+
+
+def test_wobble_never_overflows_its_zone_visibly():
+    """fill + wobble must not run so far past a zone's depth that the meter pins early."""
+    for depth, mul in ((V.WING_W, V.MUL_WING),
+                       (V.V_VIS - V.BOTTOM_TOP, V.MUL_BASS),
+                       (V.BOTTOM_TOP, V.MUL_CENTRE)):
+        assert V.BAND_MAX * mul + V.WOBBLE_MAX < depth + 2 * mul + V.WOBBLE_MAX + 1
+
+
 def _main():
     checks = [test_every_pixel_maps_to_exactly_one_zone,
               test_zone_groups_land_in_the_right_regions,
@@ -163,7 +216,12 @@ def _main():
               test_flash_lifts_everything_and_saturates,
               test_visual_state_defaults_draw_something,
               test_visual_state_write_and_readback,
-              test_pmod_packing_bit_positions]
+              test_pmod_packing_bit_positions,
+              test_wobble_is_a_bounded_triangle,
+              test_silence_stays_black_at_every_frame,
+              test_animation_actually_moves,
+              test_render_is_deterministic,
+              test_wobble_never_overflows_its_zone_visibly]
     print("SeeTheBeat visual back-end golden-model self-check")
     print("-" * 58)
     ok = 0

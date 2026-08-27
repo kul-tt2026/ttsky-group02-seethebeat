@@ -97,6 +97,13 @@ def test_zone_splits_match():
     _cmp(PIXEL_GEN, "CENTRE_SPLIT", V.CENTRE_SPLIT, "pixel_gen.v")
 
 
+def test_animation_constants_match():
+    """The breathing effect's constants live in both places too, so guard them the same way
+    -- a FRAME_W mismatch would change the breathing period without any test noticing."""
+    _cmp(PIXEL_GEN, "FRAME_W", V.FRAME_W, "pixel_gen.v")
+    _cmp(PIXEL_GEN, "WOBBLE_MAX", V.WOBBLE_MAX, "pixel_gen.v")
+
+
 def test_visual_state_shape_matches():
     _cmp(PIXEL_GEN, "NBANDS", V.NBANDS, "pixel_gen.v")
     _cmp(PIXEL_GEN, "BAND_W", V.BAND_W, "pixel_gen.v")
@@ -133,6 +140,7 @@ def test_fill_multipliers_are_what_the_rtl_hardcodes():
 def _main():
     checks = [test_screen_size_matches, test_region_boundaries_match,
               test_zone_splits_match, test_visual_state_shape_matches,
+              test_animation_constants_match,
               test_every_zone_can_actually_fill,
               test_fill_multipliers_are_what_the_rtl_hardcodes]
     print("SeeTheBeat RTL-vs-model geometry sync check")

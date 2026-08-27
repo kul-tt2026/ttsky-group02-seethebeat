@@ -83,6 +83,31 @@ MUL_WING = 4
 MUL_BASS = 8
 MUL_CENTRE = 12
 
+# ---- animation: the "breathing" zone edge (Part 2, Phase 1.2 / 5.2) ----
+# 800x600 pixels cannot be stored, so nothing can MOVE by being remembered -- the only
+# clock available to a stateless renderer is a frame counter, and every animation has to be
+# a function of (position, time, energy). A bouncing SPRITE would need per-object storage;
+# a bouncing BRIGHTNESS EDGE is just arithmetic on `frame`, so it is nearly free.
+#
+# Here the fill threshold gains a small time-varying offset, so each bar's tip drifts in and
+# out by a few pixels: the picture breathes instead of sitting still between beats.
+FRAME_W = 8                     # frame counter width (wraps every 256 frames ~ 4.3 s)
+WOBBLE_MAX = 7                  # peak extra fill, in pixels
+
+def wobble(frame):
+    """A triangle wave on the frame counter: 0 -> 7 -> 0 over 256 frames (~4.3 s at 60 Hz).
+
+    A triangle, not a sine: the CORDIC cannot help here. It is iterative (21 clocks per
+    result) and the renderer needs a value EVERY pixel clock, so a per-pixel sine is
+    impossible by construction. A triangle from the counter's own bits costs a handful of
+    gates and reads identically once it is driving a soft edge.
+
+    `wobble(0) == 0` deliberately, so a frame-0 render is the un-animated picture.
+    """
+    phase = (frame >> 2) & 0x3F                  # advance every 4 frames, 64 steps
+    tri = (31 - (phase & 0x1F)) if (phase & 0x20) else (phase & 0x1F)
+    return (tri >> 2) & 0x7                       # 0..7
+
 # ---- per-group hue as a 3-bit mask {r, g, b} ----
 HUE_BASS = 0b100                # red
 HUE_LOWMID = 0b101              # magenta
@@ -144,16 +169,25 @@ def _sat3(v):
     return 3 if v > 3 else v
 
 
-def pixel(px, py, active, bands, flash):
-    """The colour at (px, py). Returns (r, g, b), each 0..3."""
+def pixel(px, py, active, bands, flash, frame=0):
+    """The colour at (px, py) on frame `frame`. Returns (r, g, b), each 0..3.
+
+    `frame` defaults to 0, which is the un-animated picture (wobble(0) == 0).
+    """
     if not active:
         return (0, 0, 0)        # blanking MUST be black
 
     z, depth, mul, hue = zone_of(px, py)
     band = bands[z]
 
+    # A SILENT band must stay perfectly black -- the wobble may only ever extend a bar that
+    # is already lit, never light one that should be dark. Getting this wrong would make the
+    # whole screen shimmer faintly during quiet passages, which is exactly the opposite of
+    # the mostly-black look we want.
+    fill = 0 if band == 0 else (band * mul) + wobble(frame)
+
     r = g = b = 0
-    if depth < (band * mul):          # inside the filled part of the zone
+    if depth < fill:                  # inside the filled part of the zone
         lvl = level_of(band)
         r = lvl if (hue >> 2) & 1 else 0
         g = lvl if (hue >> 1) & 1 else 0
@@ -176,9 +210,9 @@ def pack_pmod(hsync, vsync, r, g, b):
             ((g >> 1) & 1) << 1 | ((r >> 1) & 1) << 0)
 
 
-def uo_out(hsync, vsync, px, py, active, bands, flash):
-    """Full path: zone -> fill -> colour -> flash -> blanking gate -> Pmod packing."""
-    return pack_pmod(hsync, vsync, *pixel(px, py, active, bands, flash))
+def uo_out(hsync, vsync, px, py, active, bands, flash, frame=0):
+    """Full path: zone -> fill(+wobble) -> colour -> flash -> blanking -> Pmod packing."""
+    return pack_pmod(hsync, vsync, *pixel(px, py, active, bands, flash, frame))
 
 
 class VisualState(object):
