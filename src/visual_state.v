@@ -45,11 +45,13 @@ module visual_state #(
     input  wire [ZW-1:0]      rd_zone,
     output wire [BAND_W-1:0]  band,
     output wire [FLASH_W-1:0] flash,
-    output wire [BAND_W-1:0]  cfg          // {dim[1:0], palette[1:0], bw} -- see pixel_gen
+    output wire [BAND_W-1:0]  cfg,         // {dim[1:0], palette[1:0], bw} -- see pixel_gen
+    output wire [BAND_W-1:0]  cfg2         // breathing amplitude -- see pixel_gen
 );
 
   localparam ADDR_FLASH = NBANDS;        // 16
   localparam ADDR_CFG   = NBANDS + 1;    // 17
+  localparam ADDR_CFG2  = NBANDS + 2;    // 18: breathing amplitude
 
   // The power-on default ramp below packs the zone index into the band value as
   // {index, 1'b1}, which needs BAND_W == ZW + 1. Guard it rather than truncating silently.
@@ -69,6 +71,7 @@ module visual_state #(
   // config region reads back 0 -- firmware that only publishes bands must still get a
   // normal picture. It is why brightness is encoded as a DIM amount rather than a CAP.
   reg [BAND_W-1:0]  cfg_r;
+  reg [BAND_W-1:0]  cfg2_r;   // breathing amplitude; 0 = off
 
   integer k;
   always @(posedge clk or negedge rst_n) begin
@@ -82,6 +85,7 @@ module visual_state #(
         bands[k] <= {k[ZW-1:0], 1'b1};
       flash_r <= {FLASH_W{1'b0}};
       cfg_r   <= {BAND_W{1'b0}};
+      cfg2_r  <= {BAND_W{1'b0}};
     end else if (wr_en) begin
       if (wr_addr < ADDR_FLASH)
         bands[wr_addr[ZW-1:0]] <= wr_data;
@@ -89,12 +93,15 @@ module visual_state #(
         flash_r <= wr_data[FLASH_W-1:0];
       else if (wr_addr == ADDR_CFG)
         cfg_r <= wr_data;
-      // addresses above ADDR_CFG are ignored -- reserved for further config
+      else if (wr_addr == ADDR_CFG2)
+        cfg2_r <= wr_data;
+      // addresses above ADDR_CFG2 are ignored -- reserved for further config
     end
   end
 
   assign band  = bands[rd_zone];
   assign flash = flash_r;
   assign cfg   = cfg_r;
+  assign cfg2  = cfg2_r;
 
 endmodule

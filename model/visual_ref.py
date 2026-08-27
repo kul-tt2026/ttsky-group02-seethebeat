@@ -92,9 +92,19 @@ MUL_CENTRE = 12
 # Here the fill threshold gains a small time-varying offset, so each bar's tip drifts in and
 # out by a few pixels: the picture breathes instead of sitting still between beats.
 FRAME_W = 8                     # frame counter width (wraps every 256 frames ~ 4.3 s)
-WOBBLE_MAX = 7                  # peak extra fill, in pixels
+WOBBLE_MAX = 63                 # HARD CEILING in silicon; firmware picks the value below it
+# History worth keeping: the first version used 7 px, and the whole breathing range was then
+# SMALLER than a single band increment in the bass (8 px) and centre (12 px) zones -- 82% of
+# the screen -- so the effect sat below the quantisation of the thing it modulates and was
+# simply invisible. The lesson generalises: an effect that modulates a quantised quantity
+# must span at least a few of its steps to be seen at all.
+#
+# The amplitude is now FIRMWARE-CONTROLLED (config word 18) rather than a fixed parameter,
+# because a value you cannot retune after tape-out is a value you will get wrong. 63 is only
+# the ceiling the hardware can express.
+WOBBLE_STEP = 2                 # config units are 2 px, so 5 bits reach 0..62
 
-def wobble(frame):
+def wobble(frame, amp_cfg=0):
     """A triangle wave on the frame counter: 0 -> 7 -> 0 over 256 frames (~4.3 s at 60 Hz).
 
     A triangle, not a sine: the CORDIC cannot help here. It is iterative (21 clocks per
@@ -103,10 +113,17 @@ def wobble(frame):
     gates and reads identically once it is driving a soft edge.
 
     `wobble(0) == 0` deliberately, so a frame-0 render is the un-animated picture.
+
+    `amp_cfg` is config word 18: the peak amplitude in units of WOBBLE_STEP pixels. The
+    triangle is CLIPPED to it rather than scaled, so a low setting gives a swell that
+    reaches its cap and holds briefly -- which reads well and costs one comparator.
+    amp_cfg == 0 means no breathing at all, which is a legitimate setting and the state an
+    unwritten config region leaves the chip in.
     """
-    phase = (frame >> 2) & 0x3F                  # advance every 4 frames, 64 steps
-    tri = (31 - (phase & 0x1F)) if (phase & 0x20) else (phase & 0x1F)
-    return (tri >> 2) & 0x7                       # 0..7
+    phase = (frame >> 1) & 0x7F                  # advance every 2 frames, 128 steps
+    tri = (63 - (phase & 0x3F)) if (phase & 0x40) else (phase & 0x3F)   # 0..63
+    cap = min(amp_cfg * WOBBLE_STEP, WOBBLE_MAX)
+    return cap if tri > cap else tri
 
 # ---- per-group hue as a 3-bit mask {r, g, b} ----
 # With 1 bit per channel in the mask there are 7 non-black hues available:
@@ -135,6 +152,7 @@ PALETTES = [
 # DIM amount rather than a CAP is what makes that true -- a cap of 0 would blank the
 # screen on any firmware that forgot to set it.
 CFG_ADDR = NBANDS + 1           # 17
+CFG2_ADDR = NBANDS + 2          # 18: wobble amplitude, in WOBBLE_STEP-pixel units
 CFG_BW_BIT = 0                  # 1 = greyscale
 CFG_PALETTE_SHIFT = 1           # bits [2:1]
 CFG_DIM_SHIFT = 3               # bits [4:3], 0 = full brightness
@@ -207,7 +225,7 @@ def _cap(v, cap):
     return cap if v > cap else v
 
 
-def pixel(px, py, active, bands, flash, frame=0, cfg=0):
+def pixel(px, py, active, bands, flash, frame=0, cfg=0, cfg2=0):
     """The colour at (px, py) on frame `frame`. Returns (r, g, b), each 0..3.
 
     `frame` defaults to 0 (the un-animated picture, wobble(0) == 0) and `cfg` to 0
@@ -227,7 +245,7 @@ def pixel(px, py, active, bands, flash, frame=0, cfg=0):
     # is already lit, never light one that should be dark. Getting this wrong would make the
     # whole screen shimmer faintly during quiet passages, which is exactly the opposite of
     # the mostly-black look we want.
-    fill = 0 if band == 0 else (band * mul) + wobble(frame)
+    fill = 0 if band == 0 else (band * mul) + wobble(frame, cfg2)
 
     r = g = b = 0
     if depth < fill:                  # inside the filled part of the zone
@@ -255,9 +273,10 @@ def pack_pmod(hsync, vsync, r, g, b):
             ((g >> 1) & 1) << 1 | ((r >> 1) & 1) << 0)
 
 
-def uo_out(hsync, vsync, px, py, active, bands, flash, frame=0, cfg=0):
+def uo_out(hsync, vsync, px, py, active, bands, flash, frame=0, cfg=0, cfg2=0):
     """Full path: zone -> fill(+wobble) -> palette -> flash/cap -> blanking -> Pmod."""
-    return pack_pmod(hsync, vsync, *pixel(px, py, active, bands, flash, frame, cfg))
+    return pack_pmod(hsync, vsync,
+                     *pixel(px, py, active, bands, flash, frame, cfg, cfg2))
 
 
 class VisualState(object):
@@ -268,6 +287,7 @@ class VisualState(object):
 
     ADDR_FLASH = NBANDS
     ADDR_CFG = CFG_ADDR
+    ADDR_CFG2 = CFG2_ADDR
 
     def __init__(self):
         self.reset()
@@ -276,6 +296,7 @@ class VisualState(object):
         self.bands = list(DEFAULT_BANDS)
         self.flash = DEFAULT_FLASH
         self.cfg = 0                     # all-zero = classic palette, colour, full bright
+        self.cfg2 = 0                    # wobble amplitude; 0 = breathing off
 
     def write(self, addr, data):
         if addr < NBANDS:
@@ -284,7 +305,9 @@ class VisualState(object):
             self.flash = data & ((1 << FLASH_W) - 1)
         elif addr == self.ADDR_CFG:
             self.cfg = data & BAND_MAX
-        # addresses above ADDR_CFG are ignored (reserved for further config)
+        elif addr == self.ADDR_CFG2:
+            self.cfg2 = data & BAND_MAX
+        # addresses above ADDR_CFG2 are ignored (reserved for further config)
 
     def read_band(self, zone):
         return self.bands[zone & (NBANDS - 1)]

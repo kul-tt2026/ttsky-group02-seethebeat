@@ -51,7 +51,7 @@ module tt_um_group02_seethebeat (
   wire        active, hsync, vsync, vblank, frame_start;
   wire [1:0]  vga_r, vga_g, vga_b;
   wire [3:0]  zone;
-  wire [4:0]  band, flash, cfg;
+  wire [4:0]  band, flash, cfg, cfg2;
 
   // ---- the animation clock ----
   // 800x600 pixels cannot be stored, so nothing animates by being remembered. The only
@@ -78,14 +78,14 @@ module tt_um_group02_seethebeat (
   visual_state u_vs (
       .clk(clk), .rst_n(rst_n),
       .wr_en(vs_wr_en), .wr_addr(vs_wr_addr), .wr_data(vs_wr_data),
-      .rd_zone(zone), .band(band), .flash(flash), .cfg(cfg)
+      .rd_zone(zone), .band(band), .flash(flash), .cfg(cfg), .cfg2(cfg2)
   );
 
   // Combinational chain, no loop: pixel_gen decodes (px,py) -> zone, visual_state muxes
   // zone -> band, pixel_gen turns band -> colour. All inside one pixel clock.
   pixel_gen u_pix (
       .px(px), .py(py), .active(active),
-      .zone(zone), .band(band), .flash(flash), .frame(frame), .cfg(cfg),
+      .zone(zone), .band(band), .flash(flash), .frame(frame), .cfg(cfg), .cfg2(cfg2),
       .r(vga_r), .g(vga_g), .b(vga_b)
   );
 

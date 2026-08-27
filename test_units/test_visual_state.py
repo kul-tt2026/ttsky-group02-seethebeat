@@ -164,3 +164,23 @@ async def test_config_register(dut):
     await _write(dut, 3, 7)
     assert int(dut.cfg.value) == 0b10101, "a band write clobbered cfg"
     assert int(dut.flash.value) == 0, "a band write clobbered flash"
+
+
+@cocotb.test()
+async def test_second_config_register(dut):
+    """CFG address 18 holds the breathing amplitude. Reset to 0 (= breathing off), writable,
+    and isolated from the bands, flash and the first config word."""
+    cocotb.start_soon(Clock(dut.clk, 25, unit="ns").start())
+    await _reset(dut)
+
+    assert int(dut.cfg2.value) == 0, "breathing must default to off"
+    bands_before = await _dump(dut)
+
+    await _write(dut, V.VisualState.ADDR_CFG, 0b10101)
+    for val in (1, 8, V.BAND_MAX, 0):
+        await _write(dut, V.VisualState.ADDR_CFG2, val)
+        assert int(dut.cfg2.value) == val, "cfg2={} expected {}".format(
+            int(dut.cfg2.value), val)
+        assert int(dut.cfg.value) == 0b10101, "cfg2 write clobbered cfg"
+    assert await _dump(dut) == bands_before, "cfg2 writes disturbed the bands"
+    assert int(dut.flash.value) == 0, "cfg2 writes disturbed flash"

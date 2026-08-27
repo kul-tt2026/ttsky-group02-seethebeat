@@ -153,13 +153,29 @@ def test_pmod_packing_bit_positions():
 
 
 def test_wobble_is_a_bounded_triangle():
-    vals = [V.wobble(f) for f in range(1 << V.FRAME_W)]
-    assert V.wobble(0) == 0, "frame 0 must be the un-animated picture"
-    assert min(vals) == 0 and max(vals) == V.WOBBLE_MAX, (min(vals), max(vals))
-    # rises then falls, never jumps by more than 1 -- a jump would read as a stutter
+    """At full amplitude the wobble must be a clean triangle: starts at 0, reaches the
+    configured peak, never steps by more than 1 (a jump would read as a stutter)."""
+    amp = 31                                   # max config value
+    vals = [V.wobble(f, amp) for f in range(1 << V.FRAME_W)]
+    assert V.wobble(0, amp) == 0, "frame 0 must be the un-animated picture"
+    assert min(vals) == 0, min(vals)
+    assert max(vals) == min(amp * V.WOBBLE_STEP, V.WOBBLE_MAX), max(vals)
     for a, b in zip(vals, vals[1:]):
         assert abs(a - b) <= 1, "wobble jumps from {} to {}".format(a, b)
-    assert vals[:len(vals)//2] != vals[len(vals)//2:], "wobble must actually vary"
+    assert vals[:len(vals) // 2] != vals[len(vals) // 2:], "wobble must actually vary"
+
+
+def test_wobble_amplitude_is_firmware_controlled():
+    """The whole point of moving amplitude into config word 18: it must be tunable, and
+    0 must mean genuinely off (which is where an unwritten config region leaves it)."""
+    assert [V.wobble(f, 0) for f in range(1 << V.FRAME_W)] == [0] * (1 << V.FRAME_W),         "cfg2 = 0 must disable breathing entirely"
+    prev = -1
+    for amp in range(32):
+        peak = max(V.wobble(f, amp) for f in range(1 << V.FRAME_W))
+        assert peak >= prev, "amplitude {} peaks lower than {}".format(amp, amp - 1)
+        assert peak == min(amp * V.WOBBLE_STEP, V.WOBBLE_MAX), (amp, peak)
+        prev = peak
+    assert prev > 15, "the top setting should reach well past the old fixed 15 px"
 
 
 def test_silence_stays_black_at_every_frame():
@@ -169,21 +185,31 @@ def test_silence_stays_black_at_every_frame():
     for frame in range(0, 1 << V.FRAME_W, 7):
         for py in range(0, V.V_VIS, 29):
             for px in range(0, V.H_VIS, 37):
-                assert V.pixel(px, py, True, ALL_OFF, 0, frame) == (0, 0, 0), (px, py, frame)
+                assert V.pixel(px, py, True, ALL_OFF, 0, frame, 0, 31) == (
+                    0, 0, 0), (px, py, frame)
 
 
 def test_animation_actually_moves():
-    """A lit bar's length must change across a breathing cycle, or the effect is dead code."""
+    """A lit bar's length must change across a breathing cycle -- and by the configured
+    amount. This is what caught the effect being invisible at the original 7 px: the range
+    must span several band steps to be seen at all."""
     bands = list(ALL_OFF)
     bands[0] = 8                                  # one bass zone, mid level
-    lengths = set()
-    for frame in range(0, 1 << V.FRAME_W, 4):
-        lit = sum(1 for py in range(V.BOTTOM_TOP, V.V_VIS)
-                  if V.pixel(100, py, True, bands, 0, frame) != (0, 0, 0))
-        lengths.add(lit)
-    assert len(lengths) > 1, "bar length never changes -- the wobble does nothing"
-    assert max(lengths) - min(lengths) == V.WOBBLE_MAX,         "bar should breathe by exactly WOBBLE_MAX px, got {}".format(
-            max(lengths) - min(lengths))
+    for amp in (4, 15, 31):
+        lengths = set()
+        for frame in range(0, 1 << V.FRAME_W, 2):
+            lit = sum(1 for py in range(V.BOTTOM_TOP, V.V_VIS)
+                      if V.pixel(100, py, True, bands, 0, frame, 0, amp) != (0, 0, 0))
+            lengths.add(lit)
+        span = max(lengths) - min(lengths)
+        expect = min(amp * V.WOBBLE_STEP, V.WOBBLE_MAX)
+        assert span == expect, "amp {}: bar breathed {} px, expected {}".format(
+            amp, span, expect)
+    # and with breathing off the bar must be perfectly still
+    still = {sum(1 for py in range(V.BOTTOM_TOP, V.V_VIS)
+                 if V.pixel(100, py, True, bands, 0, f, 0, 0) != (0, 0, 0))
+             for f in range(0, 1 << V.FRAME_W, 8)}
+    assert len(still) == 1, "cfg2 = 0 must hold the bar completely still"
 
 
 def test_render_is_deterministic():
@@ -283,6 +309,17 @@ def test_config_never_lights_a_silent_band():
             assert V.pixel(px, py, True, ALL_OFF, 0, 77, cfg) == (0, 0, 0), (cfg, px, py)
 
 
+def test_visual_state_carries_cfg2():
+    st = V.VisualState()
+    assert st.cfg2 == 0, "breathing must default to off"
+    st.write(V.VisualState.ADDR_CFG2, 21)
+    assert st.cfg2 == 21 and st.cfg == 0, "cfg2 write leaked into cfg"
+    st.write(V.VisualState.ADDR_CFG2 + 1, 31)      # reserved -> inert
+    assert st.cfg2 == 21
+    st.reset()
+    assert st.cfg2 == 0
+
+
 def test_visual_state_carries_cfg():
     st = V.VisualState()
     assert st.cfg == 0
@@ -307,6 +344,7 @@ def _main():
               test_visual_state_write_and_readback,
               test_pmod_packing_bit_positions,
               test_wobble_is_a_bounded_triangle,
+              test_wobble_amplitude_is_firmware_controlled,
               test_silence_stays_black_at_every_frame,
               test_animation_actually_moves,
               test_render_is_deterministic,
@@ -318,7 +356,8 @@ def _main():
               test_each_palette_is_distinct_and_legal,
               test_palette_select_actually_changes_colour,
               test_config_never_lights_a_silent_band,
-              test_visual_state_carries_cfg]
+              test_visual_state_carries_cfg,
+              test_visual_state_carries_cfg2]
     print("SeeTheBeat visual back-end golden-model self-check")
     print("-" * 58)
     ok = 0

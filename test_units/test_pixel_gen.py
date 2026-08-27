@@ -29,7 +29,7 @@ ALL_OFF = [0] * V.NBANDS
 ALL_FULL = [V.BAND_MAX] * V.NBANDS
 
 
-async def _check(dut, px, py, active, bands, flash, frame=0, cfg=0):
+async def _check(dut, px, py, active, bands, flash, frame=0, cfg=0, cfg2=0):
     """Drive a pixel through the real zone->band->colour chain and compare to the model."""
     dut.px.value = px
     dut.py.value = py
@@ -37,6 +37,7 @@ async def _check(dut, px, py, active, bands, flash, frame=0, cfg=0):
     dut.flash.value = flash
     dut.frame.value = frame
     dut.cfg.value = cfg
+    dut.cfg2.value = cfg2
     await Timer(1, unit="ns")
 
     z = int(dut.zone.value)
@@ -48,7 +49,7 @@ async def _check(dut, px, py, active, bands, flash, frame=0, cfg=0):
     await Timer(1, unit="ns")
 
     got = (int(dut.r.value), int(dut.g.value), int(dut.b.value))
-    exp = V.pixel(px, py, active, bands, flash, frame, cfg) if active else (0, 0, 0)
+    exp = V.pixel(px, py, active, bands, flash, frame, cfg, cfg2) if active else (0, 0, 0)
     assert got == exp, (
         "({},{}) act={} flash={} frame={} cfg={}: rtl={} model={}".format(
             px, py, active, flash, frame, cfg, got, exp))
@@ -158,12 +159,13 @@ async def test_breathing_edge_across_frames(dut):
     drifts in and out. Walk a full breathing cycle at the bar edge, where the effect lives.
     """
     bands = [8] * V.NBANDS
-    for frame in range(0, 1 << V.FRAME_W, 5):
-        base = 8 * V.MUL_BASS
-        for depth in (base - 1, base, base + V.WOBBLE_MAX,
-                      base + V.WOBBLE_MAX + 1, base + 2):
-            if 0 <= depth < VV - V.BOTTOM_TOP:
-                await _check(dut, 100, VV - 1 - depth, True, bands, 0, frame)
+    for amp in (0, 8, 31):
+        peak = min(amp * V.WOBBLE_STEP, V.WOBBLE_MAX)
+        for frame in range(0, 1 << V.FRAME_W, 9):
+            base = 8 * V.MUL_BASS
+            for depth in (base - 1, base, base + peak, base + peak + 1, base + 2):
+                if 0 <= depth < VV - V.BOTTOM_TOP:
+                    await _check(dut, 100, VV - 1 - depth, True, bands, 0, frame, 0, amp)
 
 
 @cocotb.test()
@@ -173,7 +175,7 @@ async def test_silence_stays_black_at_every_frame(dut):
     for frame in range(0, 1 << V.FRAME_W, 11):
         for (px, py) in [(100, VV - 1), (100, VV - 60), (0, 0), (60, 200),
                          (400, 0), (400, 200), (799, 100), (260, 5)]:
-            await _check(dut, px, py, True, ALL_OFF, 0, frame)
+            await _check(dut, px, py, True, ALL_OFF, 0, frame, 0, 31)
             assert (int(dut.r.value), int(dut.g.value),
                     int(dut.b.value)) == (0, 0, 0), (
                 "silence lit up at frame {} ({},{})".format(frame, px, py))
@@ -225,3 +227,29 @@ async def test_bw_and_dim_extremes(dut):
             await _check(dut, px, py, True, ALL_FULL, 31, 0, black)
             assert (int(dut.r.value), int(dut.g.value), int(dut.b.value)) == (0, 0, 0), (
                 "full dim must black everything, even the kick flash")
+
+
+@cocotb.test()
+async def test_breathing_amplitude_is_firmware_controlled(dut):
+    """cfg2 (config word 18) sets the breathing amplitude. Two things matter: 0 must hold
+    the bar perfectly still, and a higher setting must visibly move it -- the original fixed
+    7 px was below one band step in the bass and centre, so it could not be seen at all."""
+    bands = [8] * V.NBANDS
+    col, base = 100, 8 * V.MUL_BASS
+
+    def lit_at(frame_vals, amp):
+        return frame_vals, amp
+
+    for amp, expect in ((0, 0), (8, min(8 * V.WOBBLE_STEP, V.WOBBLE_MAX)),
+                        (31, min(31 * V.WOBBLE_STEP, V.WOBBLE_MAX))):
+        seen = set()
+        for frame in range(0, 1 << V.FRAME_W, 7):
+            n = 0
+            for depth in range(base - 2, min(base + V.WOBBLE_MAX + 2, VV - V.BOTTOM_TOP)):
+                await _check(dut, col, VV - 1 - depth, True, bands, 0, frame, 0, amp)
+                if (int(dut.r.value), int(dut.g.value), int(dut.b.value)) != (0, 0, 0):
+                    n += 1
+            seen.add(n)
+        span = max(seen) - min(seen)
+        assert span == expect, "amp {}: bar breathed {} px, expected {}".format(
+            amp, span, expect)

@@ -128,6 +128,13 @@ def test_every_zone_can_actually_fill():
             "{}: reach {} wastes range over a depth of {}".format(what, reach, depth)
 
 
+def test_wobble_step_is_what_the_rtl_hardcodes():
+    """pixel_gen.v builds the amplitude as {cfg2, 1'b0}, i.e. a hardcoded x2. If the model
+    ever wants a different step the concatenation must change too, so pin it here -- the
+    same pattern as the fill multipliers below."""
+    assert V.WOBBLE_STEP == 2,         "model WOBBLE_STEP is {} but pixel_gen.v hardcodes x2".format(V.WOBBLE_STEP)
+
+
 def test_fill_multipliers_are_what_the_rtl_hardcodes():
     """pixel_gen.v builds the fill as base = band<<2, then base / base<<1 / base<<1+base.
     That hardcodes x4 / x8 / x12 -- if the model ever wants different multipliers, the RTL
@@ -142,6 +149,7 @@ def _main():
               test_zone_splits_match, test_visual_state_shape_matches,
               test_animation_constants_match,
               test_every_zone_can_actually_fill,
+              test_wobble_step_is_what_the_rtl_hardcodes,
               test_fill_multipliers_are_what_the_rtl_hardcodes]
     print("SeeTheBeat RTL-vs-model geometry sync check")
     print("-" * 58)

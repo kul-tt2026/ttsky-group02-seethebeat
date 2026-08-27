@@ -50,7 +50,7 @@ module pixel_gen #(
     parameter PXW     = 11,           // width of px (vga_timing's HW)
     parameter PYW     = 10,           // width of py (vga_timing's VW)
     parameter FRAME_W = 8,            // frame-counter width (wraps every 256 frames)
-    parameter WOBBLE_MAX = 7,         // peak extra fill from the breathing effect, px
+    parameter WOBBLE_MAX = 63,        // HARD CEILING on the breathing amplitude, px
     // ---- DERIVED -- do not override ----
     parameter integer ZW = $clog2(NBANDS)
 ) (
@@ -63,11 +63,18 @@ module pixel_gen #(
     input  wire [FLASH_W-1:0]  flash,
     input  wire [FRAME_W-1:0]  frame,       // increments once per frame: the animation clock
     input  wire [BAND_W-1:0]   cfg,         // {dim[1:0], palette[1:0], bw}, 0 = classic
+    input  wire [BAND_W-1:0]   cfg2,        // breathing amplitude, in 2-pixel units
 
     output wire [1:0]          r,
     output wire [1:0]          g,
     output wire [1:0]          b
 );
+
+  // The breathing triangle below reads phase[6] as its direction bit and phase[5:0] as the
+  // ramp, i.e. it assumes a 7-bit phase == frame[FRAME_W-1:1] with FRAME_W == 8. Guard it
+  // rather than let a changed FRAME_W silently reshape the animation.
+  initial if (FRAME_W != 8)
+    $error("pixel_gen: the breathing triangle assumes FRAME_W == 8 (got %0d)", FRAME_W);
 
   // ---- geometry (REBALANCED 2026-08-27: more screen for bass, less for highs) ----
   localparam BOTTOM_TOP   = 360;                  // bass strip: py >= 360, so 240 px deep
@@ -140,17 +147,27 @@ module pixel_gen #(
   //      per result) while the renderer needs a value EVERY pixel clock, so a per-pixel
   //      sine is impossible by construction. A triangle off the counter's own bits costs a
   //      few gates and is indistinguishable once it drives a soft edge.
-  wire [5:0] phase = frame[FRAME_W-1:2];                    // advance every 4 frames
-  wire [4:0] tri_wave = phase[5] ? (5'd31 - phase[4:0]) : phase[4:0];
+  wire [6:0] phase = frame[FRAME_W-1:1];                    // advance every 2 frames
+  wire [5:0] tri_wave = phase[6] ? (6'd63 - phase[5:0]) : phase[5:0];   // 0..63
   // (`tri` is a Verilog reserved net type -- do not use it as a signal name.)
-  wire [2:0] wob      = tri_wave[4:2];                              // 0..7, wob == 0 at frame 0
+
+  // AMPLITUDE IS FIRMWARE-CONTROLLED (config word 18), not a fixed parameter: a value you
+  // cannot retune after tape-out is a value you will get wrong. cfg2 gives the peak in
+  // WOBBLE_STEP-pixel units, so 5 bits reach 0..62 px; WOBBLE_MAX is only the ceiling the
+  // hardware can express. The triangle is CLIPPED to the cap rather than scaled -- one
+  // comparator, and a low setting reads as a swell that reaches its cap and holds.
+  // cfg2 == 0 means no breathing, which is a legitimate setting and where an unwritten
+  // config region leaves the chip.
+  wire [6:0] amp_raw = {cfg2, 1'b0};                        // cfg2 * 2
+  wire [5:0] amp_cap = (amp_raw > {1'b0, WOBBLE_MAX[5:0]}) ? WOBBLE_MAX[5:0] : amp_raw[5:0];
+  wire [5:0] wob     = (tri_wave > amp_cap) ? amp_cap : tri_wave;
 
   // A SILENT band must stay perfectly black: the wobble may only extend a bar that is
   // already lit, never light one that should be dark. Without this guard the whole screen
   // would shimmer faintly through quiet passages -- the opposite of the mostly-black look.
   wire silent = (band == {BAND_W{1'b0}});
   wire [PXW-1:0] fill = silent ? {PXW{1'b0}}
-                               : (fill_raw + {{(PXW-3){1'b0}}, wob});
+                               : (fill_raw + {{(PXW-6){1'b0}}, wob});
 
   wire lit = (depth < fill);
 
@@ -211,6 +228,11 @@ module pixel_gen #(
   // visual_state change. Sinking them explicitly, per CLAUDE.md sec.7 -- never a global waiver.
   // (Assumes FLASH_W >= 3, which visual_state's elaboration guard already enforces.)
   wire _unused_flash = &{1'b0, flash[FLASH_W-3:0]};
+
+  // frame[0] is dropped on purpose: the breathing phase advances once every 2 frames, which
+  // with a 128-step triangle is what sets the ~4.3 s period.
+  // (amp_raw[6] is NOT sunk -- the 7-bit comparison in amp_cap reads it.)
+  wire _unused_anim = &{1'b0, frame[0]};
 
   wire [2:0] rsum = {1'b0, zr} + {1'b0, fl};
   wire [2:0] gsum = {1'b0, zg} + {1'b0, fl};

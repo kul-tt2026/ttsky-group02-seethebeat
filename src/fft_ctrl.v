@@ -22,7 +22,7 @@ module fft_ctrl #(
     parameter integer LOGN = 9,       // log2(N); N = 512 for the real chip
     parameter integer DW   = 16,      // Q1.15 component width
     parameter integer ANGW = 20,      // CORDIC angle width (2^ANGW = full circle)
-    parameter integer VS_N = 18,      // visual_state words: 16 bands + flash + config
+    parameter integer VS_N = 19,      // visual_state words: 16 bands + flash + 2 config
     parameter integer VS_W = 5        // bits kept from each fetched word
 ) (
     input  wire       clk,

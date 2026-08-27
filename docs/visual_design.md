@@ -34,11 +34,12 @@ follows from that.
 | `band[0..15]` | 16 | 5 bits (0–31) | `0`–`15` | energy in that frequency band |
 | `flash` | 1 | 5 bits (0–31) | `16` | global kick-flash level |
 | `cfg` | 1 | 5 bits | `17` | look config: `{dim[1:0], palette[1:0], bw}` |
+| `cfg2` | 1 | 5 bits | `18` | breathing amplitude, in 2-px units (0 = off) |
 
 The chip also keeps an 8-bit **`frame` counter** (not part of `visual_state` — it is
 generated on chip from `frame_start`), which drives the breathing edge in §4.
 
-**90 flip-flops total** (16×5 bands + 5 flash + 5 config), plus a 16:1 read mux. This is the largest single area item in the
+**95 flip-flops total** (16×5 bands + 5 flash + 2×5 config), plus a 16:1 read mux. This is the largest single area item in the
 visual back-end and the main knob if utilisation gets tight — cost scales directly as
 `NBANDS × BAND_W`.
 
@@ -130,7 +131,17 @@ For each pixel, in one clock:
    - `frame` is an 8-bit counter incremented once per `frame_start`; it wraps every 256
      frames (~4.3 s at 60 Hz). It is the **only** clock a stateless renderer has — nothing
      can animate by being remembered, because nothing can be stored.
-   - `wobble = triangle(frame)`, ranging 0–7 px, one full breath per wrap.
+   - `wobble = triangle(frame)`, **clipped to the firmware-set amplitude** (config word 18,
+     in 2-px units → 0–62 px), one full breath per wrap.
+   - **The amplitude is a knob, not a constant.** The first version fixed it at 7 px — and
+     at 7 px the entire breathing range was *smaller than one band step* in the bass (8 px)
+     and centre (12 px), i.e. 82% of the screen, so the effect sat below the quantisation of
+     the thing it modulates and was simply invisible. The general lesson: **an effect that
+     modulates a quantised quantity must span several of its steps to be seen at all.**
+     Rather than guess a new constant, the amplitude moved into config — a value you cannot
+     retune after tape-out is a value you will get wrong.
+   - `cfg2 = 0` means no breathing, which is a legitimate setting and where an unwritten
+     config region leaves the chip.
    - **A triangle, not a sine, by necessity.** The CORDIC is iterative — 21 clocks per
      result — while the renderer needs a value *every pixel clock*, so a per-pixel sine is
      impossible by construction. A triangle off the counter's own bits costs a handful of
@@ -177,6 +188,9 @@ means "as before"**:
 | `[0]` | **B&W** | 0 = colour, 1 = greyscale (all three channels driven equally) |
 | `[2:1]` | **palette** | 0 classic (red/magenta/cyan/green), 1 ice, 2 fire, 3 neon |
 | `[4:3]` | **dim** | 0 = full brightness … 3 = black. Applied as the saturation ceiling, so it dims the kick flash too |
+
+And config word **18** is a fourth knob: **breathing amplitude**, 0–31 in 2-pixel units
+(0 = off, 31 = 62 px).
 
 **Why dim and not cap:** an unwritten MCU config region reads back 0. Encoding brightness as
 a *cap* would make 0 mean "black screen", so any firmware that forgot the config would ship a
@@ -251,7 +265,8 @@ word is full.
 - Zone **geometry**: which pixels belong to each zone, cell sizes, fill directions, `MUL`.
 - Zone **hue** — the bottom strip is red, permanently.
 - The brightness curve (top 2 bits, floored at 1) and flash saturation.
-- The breathing effect: its triangle shape, 0–7 px amplitude and ~4.3 s period.
+- The breathing effect's triangle shape, its ~4.3 s period, and its 62 px hardware
+  ceiling. **The amplitude itself is firmware-controlled** (config word 18).
 - `visual_state`'s **shape**: 16 bands × 5 bits + 5-bit flash, and its CFG address map.
 - VGA mode (800×600, all porches, both sync polarities) and the Pmod pin packing.
 - FFT size (512 points) and the bus protocol.
