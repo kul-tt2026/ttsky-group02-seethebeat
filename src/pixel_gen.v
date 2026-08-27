@@ -67,7 +67,11 @@ module pixel_gen #(
 
   // ---- geometry (REBALANCED 2026-08-27: more screen for bass, less for highs) ----
   localparam BOTTOM_TOP   = 360;                  // bass strip: py >= 360, so 240 px deep
-  localparam WING_W       = 160;                  // wings: px < 120 and px >= 680
+  // MUST match model/visual_ref.py WING_W. 120, not 160: at 160 the wings are 160 px deep
+  // but a full-scale band only reaches 31*MUL_WING = 124, so they could never fill --
+  // and every zone boundary from px=120 onward shifts, which is what broke test_pixel_gen.
+  // model/test_geometry_sync.py now fails CI if this drifts from the model again.
+  localparam WING_W       = 120;                  // wings: px < 120 and px >= 680
   localparam CENTRE_L     = WING_W;
   localparam CENTRE_R     = H_VIS - WING_W;       // 680
   localparam BOTTOM_SPLIT = H_VIS / 4;            // 200 px per bass zone
