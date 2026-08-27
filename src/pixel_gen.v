@@ -10,7 +10,7 @@
  *
  * Each zone is a level meter: its band value sets how far it fills from its base (the
  * "energy bloom"), and the top bits of the band set its brightness. A silent band is
- * black -- the mostly-black DJ default.
+ * black -- the mostly-black default.
  *
  * COMMITTED TO SILICON HERE (worth reviewing before tape-out): the zone geometry and the
  * per-group hue. Which frequency feeds which band, how loud counts as full, attack/decay
@@ -67,7 +67,7 @@ module pixel_gen #(
 
   // ---- geometry (REBALANCED 2026-08-27: more screen for bass, less for highs) ----
   localparam BOTTOM_TOP   = 360;                  // bass strip: py >= 360, so 240 px deep
-  localparam WING_W       = 120;                  // wings: px < 120 and px >= 680
+  localparam WING_W       = 160;                  // wings: px < 120 and px >= 680
   localparam CENTRE_L     = WING_W;
   localparam CENTRE_R     = H_VIS - WING_W;       // 680
   localparam BOTTOM_SPLIT = H_VIS / 4;            // 200 px per bass zone
