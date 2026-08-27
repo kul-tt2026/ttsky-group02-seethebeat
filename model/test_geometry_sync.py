@@ -69,6 +69,7 @@ def _parse_consts(path):
 
 PIXEL_GEN = _parse_consts(os.path.join(SRC, "pixel_gen.v"))
 VISUAL_STATE = _parse_consts(os.path.join(SRC, "visual_state.v"))
+FFT_CTRL = _parse_consts(os.path.join(SRC, "fft_ctrl.v"))
 
 
 def _cmp(rtl, name, expected, where):
@@ -113,6 +114,17 @@ def test_visual_state_shape_matches():
     _cmp(VISUAL_STATE, "FLASH_W", V.FLASH_W, "visual_state.v")
 
 
+def test_refresh_fetches_every_config_word():
+    """fft_ctrl.v's VS_N is how many words the vblank refresh fetches. It must cover every
+    address the model defines -- 16 bands + flash + both config words. When cfg2 was added
+    and VS_N went 18 -> 19, a cocotb test still hardcoding 17 words went stale and failed in
+    a way that looked like an RTL bug; this catches that drift directly."""
+    want = V.CFG2_ADDR + 1
+    _cmp(FFT_CTRL, "VS_N", want, "fft_ctrl.v")
+    assert V.VisualState.ADDR_CFG2 == V.CFG2_ADDR
+    assert V.CFG2_ADDR == V.CFG_ADDR + 1 == V.NBANDS + 2, "config address map is not contiguous"
+
+
 def test_every_zone_can_actually_fill():
     """The failure mode a wrong WING_W reintroduces: if a zone is deeper than a full-scale
     band can reach, that meter can never look full. Checked against the model's own MULs,
@@ -148,6 +160,7 @@ def _main():
     checks = [test_screen_size_matches, test_region_boundaries_match,
               test_zone_splits_match, test_visual_state_shape_matches,
               test_animation_constants_match,
+              test_refresh_fetches_every_config_word,
               test_every_zone_can_actually_fill,
               test_wobble_step_is_what_the_rtl_hardcodes,
               test_fill_multipliers_are_what_the_rtl_hardcodes]

@@ -38,6 +38,26 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import mcu_bus_model as bus   # noqa: E402
 import fft_ref                # noqa: E402
 import visual_ref             # noqa: E402
+import visual_ref             # noqa: E402
+
+
+# cocotb runs every @cocotb.test() in ONE simulation and does NOT kill coroutines started
+# with start_soon when a test ends. Starting a second Clock would put two drivers on
+# dut.clk, and starting a second _slave_proc would leave two coroutines writing uio_in/ui_in
+# -- the previous test's slave (holding the FFT buffer) fighting the new one. That is
+# scheduling-dependent, so it shows up as a test that passes at one MCU latency and fails at
+# another. Start the clock once, and give every test a slave it kills on the way out.
+_CLK_RUNNING = [False]
+
+# how many words a refresh fetches -- derived from the model so it cannot go stale when a
+# config word is added (test_geometry_sync checks fft_ctrl.v's VS_N against the same value)
+VS_WORDS = visual_ref.CFG2_ADDR + 1
+
+
+def _start_clock(dut):
+    if not _CLK_RUNNING[0]:
+        cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+        _CLK_RUNNING[0] = True
 
 
 def _signed(v):
@@ -140,14 +160,15 @@ async def test_fft_ctrl(dut):
         logn = 6
     N = 1 << logn
 
-    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    _start_clock(dut)
     st = {"slave": None, "stalled": False}
-    cocotb.start_soon(_slave_proc(dut, st))
+    slave = cocotb.start_soon(_slave_proc(dut, st))
 
     # two-tone: the address-coverage run, executed at every N (incl. full-size 512).
     await _scenario(dut, st, N, _twotone(N), latency=2)
 
     if N > 128:
+        slave.kill()      # release the bus before any later test starts its own slave
         return  # keep the slow full-size run to one FFT; behaviour cases run at small N
 
     # full-scale (incl. -32768) -> saturation fires end-to-end; also a higher MCU latency
@@ -167,14 +188,15 @@ async def test_fft_ctrl(dut):
     assert int(dut.done.value) == 0, "chip did NOT stall on a stuck MCU (should park)"
     # recover: reset chip + MCU, reload fresh input, and a clean FFT must complete correctly
     await _scenario(dut, st, N, _twotone(N), latency=2)
+    slave.kill()          # release the bus before any later test starts its own slave
 
 
 @cocotb.test()
 async def test_visual_state_refresh(dut):
-    """The once-per-frame visual_state fetch: 17 config-reads, written out in order.
+    """The once-per-frame visual_state fetch: VS_WORDS config-reads, written out in order.
 
     Three things are worth proving and none are obvious from reading the FSM:
-      1. the values land at addresses 0..16 IN ORDER (mcu_bus responses carry no tags, so
+      1. the values land at addresses 0..VS_WORDS-1 IN ORDER (mcu_bus responses carry no tags, so
          the n-th word is only correct because it is the n-th response);
       2. it reads the CONFIG space, not the FFT buffer -- they share the same 10-bit
          address numbers and only the opcode separates them;
@@ -188,11 +210,12 @@ async def test_visual_state_refresh(dut):
         pass
     N = 1 << logn
 
-    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    _start_clock(dut)
     st = {"slave": None, "stalled": False}
-    cocotb.start_soon(_slave_proc(dut, st))
+    slave = cocotb.start_soon(_slave_proc(dut, st))
 
-    vals = [(i * 3 + 1) & 31 for i in range(16)] + [23]
+    # one distinct value per fetched word, so a shift by one is unmistakable
+    vals = [((i * 3 + 1) & 31) for i in range(VS_WORDS)]
 
     for latency in (0, 2, 5):
         sl = bus.MCUSlave(latency=latency)
@@ -212,13 +235,15 @@ async def test_visual_state_refresh(dut):
             await Timer(1, unit="ns")
             if dut.vs_wr_en.value.is_resolvable and int(dut.vs_wr_en.value) == 1:
                 writes.append((int(dut.vs_wr_addr.value), int(dut.vs_wr_data.value)))
-            if len(writes) == 17:
+            if len(writes) == VS_WORDS:
                 break
 
-        assert len(writes) == 17, "latency {}: got {} writes, expected 17".format(
-            latency, len(writes))
-        assert [a for a, _ in writes] == list(range(17)),             "latency {}: addresses out of order: {}".format(latency, [a for a, _ in writes])
-        assert [d for _, d in writes] == vals,             "latency {}: data {} != {}".format(latency, [d for _, d in writes], vals)
+        assert len(writes) == VS_WORDS, "latency {}: got {} writes, expected {}".format(
+            latency, len(writes), VS_WORDS)
+        assert [a for a, _ in writes] == list(range(VS_WORDS)), (
+            "latency {}: addresses out of order: {}".format(latency, [a for a, _ in writes]))
+        assert [d for _, d in writes] == vals, (
+            "latency {}: data {} != {}".format(latency, [d for _, d in writes], vals))
         assert sl.sram[0] == 0xDEAD, "a config fetch must not touch the FFT buffer"
 
     # ---- a refresh during a transform must be skipped, and must not corrupt the FFT ----
@@ -241,3 +266,4 @@ async def test_visual_state_refresh(dut):
 
     await _wait_done(dut)
     _check(st["slave"], x, N)                   # and the FFT result is still bit-exact
+    slave.kill()

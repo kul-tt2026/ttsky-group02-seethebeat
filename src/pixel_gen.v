@@ -158,8 +158,8 @@ module pixel_gen #(
   // comparator, and a low setting reads as a swell that reaches its cap and holds.
   // cfg2 == 0 means no breathing, which is a legitimate setting and where an unwritten
   // config region leaves the chip.
-  wire [6:0] amp_raw = {cfg2, 1'b0};                        // cfg2 * 2
-  wire [5:0] amp_cap = (amp_raw > {1'b0, WOBBLE_MAX[5:0]}) ? WOBBLE_MAX[5:0] : amp_raw[5:0];
+  wire [BAND_W:0] amp_raw = {cfg2, 1'b0};                   // cfg2 * 2, exact width
+  wire [5:0] amp_cap = (amp_raw > WOBBLE_MAX[BAND_W:0]) ? WOBBLE_MAX[5:0] : amp_raw;
   wire [5:0] wob     = (tri_wave > amp_cap) ? amp_cap : tri_wave;
 
   // A SILENT band must stay perfectly black: the wobble may only extend a bar that is
