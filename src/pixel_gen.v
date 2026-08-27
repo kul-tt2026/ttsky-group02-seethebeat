@@ -141,8 +141,9 @@ module pixel_gen #(
   //      sine is impossible by construction. A triangle off the counter's own bits costs a
   //      few gates and is indistinguishable once it drives a soft edge.
   wire [5:0] phase = frame[FRAME_W-1:2];                    // advance every 4 frames
-  wire [4:0] tri   = phase[5] ? (5'd31 - phase[4:0]) : phase[4:0];
-  wire [2:0] wob   = tri[4:2];                              // 0..7, wob == 0 at frame 0
+  wire [4:0] tri_wave = phase[5] ? (5'd31 - phase[4:0]) : phase[4:0];
+  // (`tri` is a Verilog reserved net type -- do not use it as a signal name.)
+  wire [2:0] wob      = tri_wave[4:2];                              // 0..7, wob == 0 at frame 0
 
   // A SILENT band must stay perfectly black: the wobble may only extend a bar that is
   // already lit, never light one that should be dark. Without this guard the whole screen
