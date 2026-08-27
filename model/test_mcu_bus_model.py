@@ -126,8 +126,59 @@ def test_nop_between_transactions():
     assert bus.drive_read(s, 8) == 0xF00D
 
 
+def test_cfgread_encoding_differs_only_in_the_opcode():
+    """CFGRD must be framed exactly like READ -- same 2 transfers, same address split --
+    so the RTL and the PIO slave share one datapath. Only the opcode changes."""
+    for addr in (0, 1, 16, 63, 64, 512, 1023):
+        r = bus.encode_read(addr)
+        c = bus.encode_cfgread(addr)
+        assert len(c) == 2, c
+        assert c[1] == r[1], "T1 (addr[5:0]) must match READ at addr {}".format(addr)
+        assert (c[0] & 0x0F) == (r[0] & 0x0F), "T0 address nibble must match READ"
+        assert (c[0] >> 4) == bus.OP_CFGRD, "T0 opcode must be 11"
+        assert (r[0] >> 4) == bus.OP_READ
+
+
+def test_cfgread_uses_a_separate_address_space():
+    """The FFT buffer already fills all 1024 words, which is the whole reason config-read
+    exists. A CFGRD to address N must NOT return sram[N]."""
+    sl = bus.MCUSlave(latency=1)
+    sl.sram[7] = 0xBEEF
+    sl.cfg[7] = 0x0015
+    got = bus.drive_cfgread(sl, 7)
+    assert got == 0x0015, "cfgread returned {:#06x}, expected the CFG value".format(got)
+    sl2 = bus.MCUSlave(latency=1)
+    sl2.sram[7] = 0xBEEF                      # cfg left empty
+    assert bus.drive_cfgread(sl2, 7) == 0, "unwritten config must read 0, not the FFT buffer"
+
+
+def test_cfgread_does_not_disturb_the_fft_buffer():
+    sl = bus.MCUSlave(latency=2)
+    for a in range(8):
+        sl.sram[a] = 0x1000 + a
+        sl.cfg[a] = a
+    before = dict(sl.sram)
+    for a in range(8):
+        assert bus.drive_cfgread(sl, a) == a
+    assert sl.sram == before, "a config-read must never touch the FFT buffer"
+
+
+def test_cfgread_burst_returns_in_order():
+    """The refresh path issues 17 back-to-back config-reads; they must come back in issue
+    order, exactly like a normal read burst."""
+    sl = bus.MCUSlave(latency=3)
+    for a in range(17):
+        sl.cfg[a] = (a * 3 + 1) & 0xFFFF
+    got = bus.drive_burst_cfgread(sl, list(range(17)))
+    assert got == [(a * 3 + 1) & 0xFFFF for a in range(17)], got
+
+
 def _main():
-    checks = [test_encode_read_bits, test_encode_write_bits,
+    checks = [test_cfgread_encoding_differs_only_in_the_opcode,
+              test_cfgread_uses_a_separate_address_space,
+              test_cfgread_does_not_disturb_the_fft_buffer,
+              test_cfgread_burst_returns_in_order,
+              test_encode_read_bits, test_encode_write_bits,
               test_encode_decode_consistent, test_roundtrip_all_latencies,
               test_burst_read_inorder, test_burst_matches_single,
               test_burst_butterfly_shape, test_overwrite, test_unwritten_reads_zero,
