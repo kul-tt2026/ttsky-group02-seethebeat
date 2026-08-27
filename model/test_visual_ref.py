@@ -24,10 +24,10 @@ def test_every_pixel_maps_to_exactly_one_zone():
     seen = [0] * V.NBANDS
     for py in range(V.V_VIS):
         for px in range(V.H_VIS):
-            z, depth, shift, hue = V.zone_of(px, py)
+            z, depth, mul, hue = V.zone_of(px, py)
             assert 0 <= z < V.NBANDS, (px, py, z)
             assert depth >= 0, (px, py, depth)
-            assert shift in (V.SHIFT_SHALLOW, V.SHIFT_DEEP)
+            assert mul in (V.MUL_WING, V.MUL_BASS, V.MUL_CENTRE)
             assert hue in (V.HUE_BASS, V.HUE_LOWMID, V.HUE_HIMID, V.HUE_HIGH)
             seen[z] += 1
     for z in range(V.NBANDS):
@@ -38,25 +38,29 @@ def test_every_pixel_maps_to_exactly_one_zone():
 def test_zone_groups_land_in_the_right_regions():
     assert V.zone_of(10, 590)[0] == 0, "bottom-left is bass zone 0"
     assert V.zone_of(790, 590)[0] == 3, "bottom-right is bass zone 3"
+    assert V.zone_of(10, 360)[0] == 0, "bass starts at py=360 after the rebalance"
+    assert V.zone_of(10, 359)[0] == 7, "the row above the bass is still the left wing"
     assert V.zone_of(10, 10)[0] == 4, "top-left is the first left-wing zone"
-    assert V.zone_of(10, 479)[0] == 7, "bottom of the left wing is zone 7"
     assert V.zone_of(790, 10)[0] == 8, "top-right is the first right-wing zone"
-    assert V.zone_of(790, 479)[0] == 11
+    assert V.zone_of(790, 359)[0] == 11
     assert V.zone_of(200, 10)[0] == 12, "centre starts at band 12"
     assert V.zone_of(630, 10)[0] == 15
+    # highs hang from the top: depth is 0 at py=0, not at the bottom of the centre
+    assert V.zone_of(400, 0)[1] == 0, "a centre column's base is the TOP of the screen"
+    assert V.zone_of(400, 359)[1] == 359
 
 
 def test_full_scale_band_fills_its_zone():
     """A band at 31 must reach the far edge of its zone, or the meter never looks full."""
-    for py in range(V.BOTTOM_TOP, V.V_VIS):          # bottom strip, 120 deep
-        z, depth, shift, _ = V.zone_of(100, py)
-        assert depth < (V.BAND_MAX << shift), (py, depth)
-    for px in range(0, V.WING_W):                     # left wing, 160 deep
-        z, depth, shift, _ = V.zone_of(px, 100)
-        assert depth < (V.BAND_MAX << shift), (px, depth)
-    for py in range(0, V.BOTTOM_TOP):                 # centre, 480 deep
-        z, depth, shift, _ = V.zone_of(400, py)
-        assert depth < (V.BAND_MAX << shift), (py, depth)
+    for py in range(V.BOTTOM_TOP, V.V_VIS):          # bass strip, 240 deep
+        z, depth, mul, _ = V.zone_of(100, py)
+        assert depth < (V.BAND_MAX * mul), (py, depth)
+    for px in range(0, V.WING_W):                     # wings, 120 deep
+        z, depth, mul, _ = V.zone_of(px, 100)
+        assert depth < (V.BAND_MAX * mul), (px, depth)
+    for py in range(0, V.BOTTOM_TOP):                 # centre, 360 deep
+        z, depth, mul, _ = V.zone_of(400, py)
+        assert depth < (V.BAND_MAX * mul), (py, depth)
 
 
 def test_silence_is_black_everywhere():

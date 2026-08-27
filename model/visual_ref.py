@@ -22,19 +22,20 @@ WHAT IS COMMITTED TO SILICON HERE  (the part worth reviewing before tape-out)
   Layout (800x600), band 0 = lowest frequency, following CLAUDE.md sec.8's sketch
   "bass -> bottom strip, mids -> side wings, highs -> centre":
 
-      px:  0        120                          680        800
-           +--------+-----------------------------+----------+  py=0
-           |   L4   |  C12 | C13 | C14 | C15       |    R8    |
-           +--------+  (4 columns of 140,          +----------+
-           |   L5   |   filling upward over 480)   |    R9    |
-           +--------+                              +----------+
-           |   L6   |                              |    R10   |
-           +--------+                              +----------+
-           |   L7   |                              |    R11   |
-           +--------+-----------------------------+----------+  py=480
-           |   B0   |    B1    |    B2    |    B3            |
-           +-------------------------------------------------+  py=600
-            wings fill inward (120 deep)   bottom fills upward (120 deep)
+      px:  0        120                           680        800
+           +--------+------------------------------+----------+  py=0
+           |   L4   | C12 | C13 | C14 | C15         |    R8    |   highs HANG DOWN
+           +--------+   (4 columns of 140,          +----------+   from the top,
+           |   L5   |    filling DOWNWARD           |    R9    |   360 deep
+           +--------+     from py=0, 360 deep)      +----------+
+           |   L6   |                               |    R10   |
+           +--------+                               +----------+
+           |   L7   |                               |    R11   |
+           +--------+------------------------------+----------+  py=360
+           |   B0   |    B1     |    B2    |    B3             |
+           |          bass, 240 deep, fills UPWARD             |
+           +--------------------------------------------------+  py=600
+            wings 120 deep, fill inward, rows of 90
 
   Each zone behaves as a level meter: the band value sets how far the zone fills from its
   base ("energy bloom"), and the top bits of the band set the brightness. A silent band is
@@ -52,25 +53,35 @@ FLASH_W = 5                     # 0..31 global kick flash
 BAND_MAX = (1 << BAND_W) - 1
 
 # ---- region boundaries ----
-BOTTOM_TOP = 480                # bottom strip occupies py >= 480 (120 px tall)
+# REBALANCED 2026-08-27 (Giel): bass deserves more of the screen, highs less.
+#   bass   800 x 240 = 192,000 px  (was 800 x 120 =  96,000)  -> +100%
+#   highs  560 x 360 = 201,600 px  (was 560 x 480 = 268,800)  ->  -25%
+#   wings  120 x 360 x2 = 86,400   (was 120 x 480 x2 = 115,200) -> -25%
+# and the highs now hang DOWNWARD FROM THE TOP of the screen instead of growing up from the
+# middle, so high frequencies read as high on the screen and bass rises to meet them.
+BOTTOM_TOP = 360                # bass strip occupies py >= 360 (240 px tall)
 WING_W = 120                    # left wing px < 120, right wing px >= 680
 CENTRE_L = WING_W               # centre spans [120, 680)
 CENTRE_R = H_VIS - WING_W
 
 BOTTOM_SPLIT = H_VIS // 4       # 200 px per bass zone
-WING_SPLIT = BOTTOM_TOP // 4    # 120 px per wing zone
+WING_SPLIT = BOTTOM_TOP // 4    # 90 px per wing zone
 CENTRE_SPLIT = (CENTRE_R - CENTRE_L) // 4   # 140 px per centre column
 
-# ---- fill scaling: depth < (band << shift) ----
-# Chosen so a full-scale band (31) just covers its zone's depth. Every SHALLOW zone is
-# deliberately 120 px deep -- bottom strip height AND wing width -- so one shift serves all
-# three: 31 << 2 = 124 >= 120. (The wings were 160 px wide in the first draft; a full-scale
-# band then reached only 124 of 160 and the meter could never look full. The golden model's
-# `test_full_scale_band_fills_its_zone` caught it before any RTL was written.)
-#   shallow zones (120 px deep) use <<2  -> 0..124
-#   the centre    (480 px deep) uses <<4 -> 0..496
-SHIFT_SHALLOW = 2
-SHIFT_DEEP = 4
+# ---- fill scaling: depth < band * MUL ----
+# MUL is chosen per region so a full-scale band (31) just covers that zone's depth without
+# wasting range. All three are multiples of 4, so the hardware computes base = band<<2 once
+# and then base, base<<1, or base<<1 + base -- one shift and one adder, no multiplier.
+#   wings   120 deep -> x4  = 124  (band 30 fills)
+#   bass    240 deep -> x8  = 248  (band 30 fills)
+#   centre  360 deep -> x12 = 372  (band 30 fills)
+# Getting this wrong is not cosmetic: with 160 px wings in the first draft a full-scale band
+# reached only 124 of 160, so the wings could never look full. The golden model's
+# `test_full_scale_band_fills_its_zone` caught it before any RTL was written -- and it is
+# what keeps this rebalance honest too.
+MUL_WING = 4
+MUL_BASS = 8
+MUL_CENTRE = 12
 
 # ---- per-group hue as a 3-bit mask {r, g, b} ----
 HUE_BASS = 0b100                # red
@@ -88,34 +99,33 @@ DEFAULT_FLASH = 0
 
 def zone_of(px, py):
     """
-    Decode a pixel to (zone, depth, shift, hue).
+    Decode a pixel to (zone, depth, mul, hue).
 
-    `depth` is the distance from the zone's BASE (the edge it fills from), so the fill test
-    is a single comparison `depth < band << shift` regardless of direction.
-    Returns zone=None for pixels that belong to no zone (they render black).
+    `depth` is the distance from the zone's BASE -- the edge it fills FROM -- so one
+    comparison `depth < band * mul` serves all four fill directions.
     """
     if py >= BOTTOM_TOP:
-        # bass: bottom strip, four 200 px columns, filling UPWARD
+        # bass: bottom strip, four 200 px columns, 240 deep, filling UPWARD
         z = px // BOTTOM_SPLIT
         if z > 3:
             z = 3
-        return z, (V_VIS - 1 - py), SHIFT_SHALLOW, HUE_BASS
+        return z, (V_VIS - 1 - py), MUL_BASS, HUE_BASS
 
     if px < WING_W:
-        # low-mid: left wing, four 120 px rows, filling RIGHTWARD
+        # low-mid: left wing, four 90 px rows, 120 deep, filling RIGHTWARD
         z = 4 + (py // WING_SPLIT)
-        return z, px, SHIFT_SHALLOW, HUE_LOWMID
+        return z, px, MUL_WING, HUE_LOWMID
 
     if px >= CENTRE_R:
         # high-mid: right wing, four rows, filling LEFTWARD
         z = 8 + (py // WING_SPLIT)
-        return z, (H_VIS - 1 - px), SHIFT_SHALLOW, HUE_HIMID
+        return z, (H_VIS - 1 - px), MUL_WING, HUE_HIMID
 
-    # highs: centre, four 120 px columns, filling UPWARD over the full 480
+    # highs: centre, four 140 px columns, 360 deep, hanging DOWNWARD FROM THE TOP
     z = 12 + ((px - CENTRE_L) // CENTRE_SPLIT)
     if z > 15:
         z = 15
-    return z, (BOTTOM_TOP - 1 - py), SHIFT_DEEP, HUE_HIGH
+    return z, py, MUL_CENTRE, HUE_HIGH
 
 
 def level_of(band):
@@ -139,11 +149,11 @@ def pixel(px, py, active, bands, flash):
     if not active:
         return (0, 0, 0)        # blanking MUST be black
 
-    z, depth, shift, hue = zone_of(px, py)
+    z, depth, mul, hue = zone_of(px, py)
     band = bands[z]
 
     r = g = b = 0
-    if depth < (band << shift):          # inside the filled part of the zone
+    if depth < (band * mul):          # inside the filled part of the zone
         lvl = level_of(band)
         r = lvl if (hue >> 2) & 1 else 0
         g = lvl if (hue >> 1) & 1 else 0
