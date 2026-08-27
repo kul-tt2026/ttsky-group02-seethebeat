@@ -21,12 +21,22 @@
 module fft_ctrl #(
     parameter integer LOGN = 9,       // log2(N); N = 512 for the real chip
     parameter integer DW   = 16,      // Q1.15 component width
-    parameter integer ANGW = 20       // CORDIC angle width (2^ANGW = full circle)
+    parameter integer ANGW = 20,      // CORDIC angle width (2^ANGW = full circle)
+    parameter integer VS_N = 17,      // visual_state words to fetch: 16 bands + flash
+    parameter integer VS_W = 5        // bits kept from each fetched word
 ) (
     input  wire       clk,
     input  wire       rst_n,
     input  wire       start,          // pulse: begin (data already loaded, bit-reversed)
     output reg        done,           // 1-cycle pulse when the in-place FFT is complete
+
+    // ---- visual_state refresh (Part 2): pulse `refresh_req` in vblank; the fetched
+    //      words are streamed out on vs_wr_*. Skipped if a transform is in flight. ----
+    input  wire       refresh_req,
+    output reg        vs_wr_en,
+    output reg [4:0]  vs_wr_addr,
+    output reg [VS_W-1:0] vs_wr_data,
+    output wire       busy,           // high while the FFT or a refresh owns the bus
 
     // pin-side bus to the MCU (see docs/bus_protocol.md)
     output wire [7:0] uio_out,
@@ -56,7 +66,7 @@ module fft_ctrl #(
   localparam [ANGW-1:0] ANG_STEP0 = {1'b1, {(ANGW-1){1'b0}}};   // 2^(ANGW-1), stage s=1
 
   localparam [2:0] S_IDLE=3'd0, S_READ=3'd1, S_COMP=3'd2, S_WRITE=3'd3,
-                   S_NEXT=3'd4, S_DONE=3'd5;
+                   S_NEXT=3'd4, S_DONE=3'd5, S_VS=3'd6;
   reg [2:0] state;
 
   // ---- FFT loop state (mirrors fft_ref.py) ----
@@ -81,6 +91,9 @@ module fft_ctrl #(
   reg [2:0]    ri, rc, wi;                       // read-issue / read-collect / write-issue
   reg          bf_started;
 
+  // ---- visual_state refresh counters (issue / collect), one per fetched word ----
+  reg [4:0]    vi, vc;
+
   // ---- the CORDIC ALU (butterfly + the one CORDIC) ----
   wire          bf_start = !bf_started && (state == S_COMP);
   wire          bf_done;
@@ -95,7 +108,7 @@ module fft_ctrl #(
   );
 
   // ---- bus request muxes ----
-  wire            rd_req, rd_accept, rd_valid, wr_req, wr_accept;
+  wire            rd_req, rd_cfg, rd_accept, rd_valid, wr_req, wr_accept;
   wire [AW-1:0]   rd_addr, wr_addr;
   wire [DW-1:0]   rd_data, wr_data;
 
@@ -126,15 +139,19 @@ module fft_ctrl #(
     endcase
   end
 
-  assign rd_req  = (state == S_READ)  && (ri != 3'd4);
-  assign rd_addr = rd_addr_c;
+  // In S_VS the refresh streams config-reads at addresses 0..VS_N-1 of the CONFIG space
+  // (a separate address space from the FFT buffer, which already fills all 1024 words).
+  assign rd_req  = ((state == S_READ) && (ri != 3'd4)) ||
+                   ((state == S_VS)   && (vi != VS_N[4:0]));
+  assign rd_cfg  = (state == S_VS);
+  assign rd_addr = (state == S_VS) ? {{(AW-5){1'b0}}, vi} : rd_addr_c;
   assign wr_req  = (state == S_WRITE) && (wi != 3'd4);
   assign wr_addr = wr_addr_c;
   assign wr_data = wr_data_c;
 
   mcu_bus #(.AW(AW), .DW(DW)) u_bus (
       .clk(clk), .rst_n(rst_n),
-      .rd_req(rd_req), .rd_addr(rd_addr), .rd_accept(rd_accept),
+      .rd_req(rd_req), .rd_addr(rd_addr), .rd_cfg(rd_cfg), .rd_accept(rd_accept),
       .rd_data(rd_data), .rd_valid(rd_valid),
       .wr_req(wr_req), .wr_addr(wr_addr), .wr_data(wr_data), .wr_accept(wr_accept),
       .uio_out(uio_out), .uio_oe(uio_oe), .uio_in(uio_in), .ui_in(ui_in)
@@ -147,17 +164,44 @@ module fft_ctrl #(
       angle_step <= {ANGW{1'b0}}; angle_acc <= {ANGW{1'b0}};
       ri <= 3'd0; rc <= 3'd0; wi <= 3'd0; bf_started <= 1'b0;
       a_re <= 0; a_im <= 0; b_re <= 0; b_im <= 0;
+      vi <= 5'd0; vc <= 5'd0;
+      vs_wr_en <= 1'b0; vs_wr_addr <= 5'd0; vs_wr_data <= {VS_W{1'b0}};
     end else begin
       done <= 1'b0;
+      vs_wr_en <= 1'b0;
       case (state)
         S_IDLE: begin
+          // The FFT wins if both arrive together: a transform is time-critical, a refresh
+          // is not. A refresh is only ever accepted from IDLE, so it can never interleave
+          // with FFT traffic -- which matters because mcu_bus returns responses strictly
+          // in order with no tags, so two interleaved readers would mis-route each other's
+          // data. If a transform is still running at vblank the refresh is simply SKIPPED
+          // for that frame; the visuals hold their previous values for one frame, which is
+          // imperceptible at 60 Hz.
           if (start) begin
             s <= S_ONE; half <= IX_ONE;                // stage 1, half = 1
             kstart <= {KW{1'b0}}; j <= {IXW{1'b0}};
             angle_step <= ANG_STEP0; angle_acc <= {ANGW{1'b0}};
             ri <= 3'd0; rc <= 3'd0;
             state <= S_READ;
+          end else if (refresh_req) begin
+            vi <= 5'd0; vc <= 5'd0;
+            state <= S_VS;
           end
+        end
+
+        // ---- visual_state refresh: stream VS_N config-reads, write each returned word's
+        //      low VS_W bits into visual_state. Responses are in order, so the n-th word
+        //      belongs at address n. ----
+        S_VS: begin
+          if (rd_req && rd_accept) vi <= vi + 5'd1;
+          if (rd_valid) begin
+            vs_wr_en   <= 1'b1;
+            vs_wr_addr <= vc;
+            vs_wr_data <= rd_data[VS_W-1:0];
+            vc         <= vc + 5'd1;
+          end
+          if (vc == VS_N[4:0]) state <= S_IDLE;
         end
 
         S_READ: begin
@@ -216,6 +260,8 @@ module fft_ctrl #(
 
   // i0/i1 are complex indices < N <= 2^IXW, so their top bit is always 0 (only
   // next_k[KW-1] is real -- it is what makes last_group fire at N). Sink for lint.
-  wire _unused = &{1'b0, i0[KW-1], i1[KW-1]};
+  assign busy = (state != S_IDLE);
+
+  wire _unused = &{1'b0, i0[KW-1], i1[KW-1], rd_data[DW-1:VS_W]};
 
 endmodule
