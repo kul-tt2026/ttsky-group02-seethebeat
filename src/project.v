@@ -54,17 +54,49 @@ module tt_um_group02_seethebeat (
   assign uio_out = fft_uio_out;
   assign uio_oe  = fft_uio_oe;
 
-  // ---- uo_out: reserved for the VGA pixel stream (Part 2) ----
-  // Until then one bit earns its keep for bring-up: fft_ready goes high when a transform
-  // completes and clears when the next one starts, so a scope or the MCU can see the engine
-  // turn over without decoding the bus. fft_ctrl's `done` is a single-cycle pulse; this
-  // latches it into a level.
-  reg fft_ready;
-  always @(posedge clk or negedge rst_n) begin
-    if (!rst_n)        fft_ready <= 1'b0;
-    else if (start)    fft_ready <= 1'b0;
-    else if (fft_done) fft_ready <= 1'b1;
-  end
-  assign uo_out = {7'b0000000, fft_ready};
+  // ---- VGA output path (Part 2, Phase 0.3) ----
+  // vga_timing owns the beam position; test_pattern is pure f(px, py). uo_out now carries
+  // the real VGA signals, as info.yaml's pinout always said it would -- the Part 1
+  // `fft_ready` bring-up flag has been retired, since the FFT engine is still fully
+  // observable on the uio bus.
+  wire [10:0] px;
+  wire [9:0]  py;
+  wire        active, hsync, vsync, vblank, frame_start;
+  wire [1:0]  vga_r, vga_g, vga_b;
+  wire [3:0]  zone;
+  wire [4:0]  band, flash;
+
+  vga_timing u_vga (
+      .clk(clk), .rst_n(rst_n),
+      .px(px), .py(py), .active(active),
+      .hsync(hsync), .vsync(vsync),
+      .vblank(vblank), .frame_start(frame_start)
+  );
+
+  // The only visual state on the chip. Its power-on defaults draw a readable picture
+  // before any firmware exists, so the output path can be validated on a monitor with
+  // nothing else connected. The MCU refresh burst (Phase 2) drives the write port.
+  visual_state u_vs (
+      .clk(clk), .rst_n(rst_n),
+      .wr_en(1'b0), .wr_addr(5'd0), .wr_data(5'd0),      // TODO(Phase 2): MCU refresh
+      .rd_zone(zone), .band(band), .flash(flash)
+  );
+
+  // Combinational chain, no loop: pixel_gen decodes (px,py) -> zone, visual_state muxes
+  // zone -> band, pixel_gen turns band -> colour. All inside one pixel clock.
+  pixel_gen u_pix (
+      .px(px), .py(py), .active(active),
+      .zone(zone), .band(band), .flash(flash),
+      .r(vga_r), .g(vga_g), .b(vga_b)
+  );
+
+  // Tiny VGA Pmod packing: uo_out = {hsync, B0, G0, R0, vsync, B1, G1, R1}.
+  // The pin NAMES are the trap -- the pin labelled R1 carries r[1], the MSB.
+  assign uo_out = {hsync, vga_b[0], vga_g[0], vga_r[0],
+                   vsync, vga_b[1], vga_g[1], vga_r[1]};
+
+  // vblank/frame_start are Phase 2's hooks (the once-per-frame visual_state refresh reads
+  // the MCU during blanking); fft_done is observable on the bus. Sink them for now.
+  wire _unused = &{1'b0, fft_done, vblank, frame_start};
 
 endmodule
