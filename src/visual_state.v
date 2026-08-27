@@ -44,10 +44,12 @@ module visual_state #(
     // ---- read port: combinational, driven by the beam every pixel ----
     input  wire [ZW-1:0]      rd_zone,
     output wire [BAND_W-1:0]  band,
-    output wire [FLASH_W-1:0] flash
+    output wire [FLASH_W-1:0] flash,
+    output wire [BAND_W-1:0]  cfg          // {dim[1:0], palette[1:0], bw} -- see pixel_gen
 );
 
-  localparam ADDR_FLASH = NBANDS;
+  localparam ADDR_FLASH = NBANDS;        // 16
+  localparam ADDR_CFG   = NBANDS + 1;    // 17
 
   // The power-on default ramp below packs the zone index into the band value as
   // {index, 1'b1}, which needs BAND_W == ZW + 1. Guard it rather than truncating silently.
@@ -62,6 +64,11 @@ module visual_state #(
 
   reg [BAND_W-1:0]  bands [0:NBANDS-1];
   reg [FLASH_W-1:0] flash_r;
+  // Config resets to ZERO, and zero is defined to mean "behave exactly as before":
+  // classic palette, full colour, full brightness. That matters because an unwritten MCU
+  // config region reads back 0 -- firmware that only publishes bands must still get a
+  // normal picture. It is why brightness is encoded as a DIM amount rather than a CAP.
+  reg [BAND_W-1:0]  cfg_r;
 
   integer k;
   always @(posedge clk or negedge rst_n) begin
@@ -74,16 +81,20 @@ module visual_state #(
       for (k = 0; k < NBANDS; k = k + 1)
         bands[k] <= {k[ZW-1:0], 1'b1};
       flash_r <= {FLASH_W{1'b0}};
+      cfg_r   <= {BAND_W{1'b0}};
     end else if (wr_en) begin
       if (wr_addr < ADDR_FLASH)
         bands[wr_addr[ZW-1:0]] <= wr_data;
       else if (wr_addr == ADDR_FLASH)
         flash_r <= wr_data[FLASH_W-1:0];
-      // addresses above ADDR_FLASH are ignored -- reserved for later config bytes
+      else if (wr_addr == ADDR_CFG)
+        cfg_r <= wr_data;
+      // addresses above ADDR_CFG are ignored -- reserved for further config
     end
   end
 
   assign band  = bands[rd_zone];
   assign flash = flash_r;
+  assign cfg   = cfg_r;
 
 endmodule

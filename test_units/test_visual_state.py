@@ -141,3 +141,26 @@ async def test_writes_need_wr_en(dut):
     await ClockCycles(dut.clk, 4)
     await Timer(1, unit="ns")
     assert await _dump(dut) == before, "state changed with wr_en low"
+
+
+@cocotb.test()
+async def test_config_register(dut):
+    """CFG address 17 holds the look config. It must reset to ZERO (= classic look), accept
+    writes, and not be disturbed by band or flash traffic."""
+    cocotb.start_soon(Clock(dut.clk, 25, unit="ns").start())
+    await _reset(dut)
+
+    assert int(dut.cfg.value) == 0, "cfg must reset to 0 (= behave as before)"
+
+    bands_before = await _dump(dut)
+    for val in (0b00001, 0b10110, V.BAND_MAX, 0):
+        await _write(dut, V.VisualState.ADDR_CFG, val)
+        assert int(dut.cfg.value) == val, "cfg={} expected {}".format(
+            int(dut.cfg.value), val)
+    assert await _dump(dut) == bands_before, "writing cfg disturbed the bands"
+
+    # a band write must not disturb cfg
+    await _write(dut, V.VisualState.ADDR_CFG, 0b10101)
+    await _write(dut, 3, 7)
+    assert int(dut.cfg.value) == 0b10101, "a band write clobbered cfg"
+    assert int(dut.flash.value) == 0, "a band write clobbered flash"

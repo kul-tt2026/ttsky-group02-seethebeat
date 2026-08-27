@@ -29,13 +29,14 @@ ALL_OFF = [0] * V.NBANDS
 ALL_FULL = [V.BAND_MAX] * V.NBANDS
 
 
-async def _check(dut, px, py, active, bands, flash, frame=0):
+async def _check(dut, px, py, active, bands, flash, frame=0, cfg=0):
     """Drive a pixel through the real zone->band->colour chain and compare to the model."""
     dut.px.value = px
     dut.py.value = py
     dut.active.value = 1 if active else 0
     dut.flash.value = flash
     dut.frame.value = frame
+    dut.cfg.value = cfg
     await Timer(1, unit="ns")
 
     z = int(dut.zone.value)
@@ -47,9 +48,10 @@ async def _check(dut, px, py, active, bands, flash, frame=0):
     await Timer(1, unit="ns")
 
     got = (int(dut.r.value), int(dut.g.value), int(dut.b.value))
-    exp = V.pixel(px, py, active, bands, flash, frame) if active else (0, 0, 0)
-    assert got == exp, "({},{}) act={} flash={} frame={}: rtl={} model={}".format(
-        px, py, active, flash, frame, got, exp)
+    exp = V.pixel(px, py, active, bands, flash, frame, cfg) if active else (0, 0, 0)
+    assert got == exp, (
+        "({},{}) act={} flash={} frame={} cfg={}: rtl={} model={}".format(
+            px, py, active, flash, frame, cfg, got, exp))
 
 
 @cocotb.test()
@@ -185,3 +187,41 @@ async def test_frame_zero_is_the_unanimated_picture(dut):
     for py in range(0, VV, 37):
         for px in range(0, H, 41):
             await _check(dut, px, py, True, bands, 0, 0)
+
+
+@cocotb.test()
+async def test_every_config_value(dut):
+    """All 32 values of the config register, sampled across the screen. cfg selects the
+    palette, greyscale and the brightness ceiling -- all of which sit on the critical
+    uo_out path, so a decode slip here is both visible and timing-relevant."""
+    for cfg in range(1 << V.BAND_W):
+        for py in range(0, VV, 97):
+            for px in range(0, H, 89):
+                await _check(dut, px, py, True, V.DEFAULT_BANDS, 9, 61, cfg)
+
+
+@cocotb.test()
+async def test_cfg_zero_matches_the_original_design(dut):
+    """The safety property: an unwritten MCU config region reads back 0, so cfg == 0 must
+    render exactly the classic look -- full colour, full brightness, palette 0."""
+    for py in range(0, VV, 43):
+        for px in range(0, H, 47):
+            await _check(dut, px, py, True, V.DEFAULT_BANDS, 5, 33, 0)
+
+
+@cocotb.test()
+async def test_bw_and_dim_extremes(dut):
+    """Greyscale must give r == g == b; full dim must black the screen even at full scale."""
+    bw = 1 << V.CFG_BW_BIT
+    for py in range(0, VV, 53):
+        for px in range(0, H, 59):
+            await _check(dut, px, py, True, ALL_FULL, 0, 0, bw)
+            assert int(dut.r.value) == int(dut.g.value) == int(dut.b.value), (
+                "B&W not grey at ({},{})".format(px, py))
+
+    black = 3 << V.CFG_DIM_SHIFT
+    for py in range(0, VV, 53):
+        for px in range(0, H, 59):
+            await _check(dut, px, py, True, ALL_FULL, 31, 0, black)
+            assert (int(dut.r.value), int(dut.g.value), int(dut.b.value)) == (0, 0, 0), (
+                "full dim must black everything, even the kick flash")

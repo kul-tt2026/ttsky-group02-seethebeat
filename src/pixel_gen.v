@@ -62,6 +62,7 @@ module pixel_gen #(
     input  wire [BAND_W-1:0]   band,        // <- visual_state.band (for `zone`)
     input  wire [FLASH_W-1:0]  flash,
     input  wire [FRAME_W-1:0]  frame,       // increments once per frame: the animation clock
+    input  wire [BAND_W-1:0]   cfg,         // {dim[1:0], palette[1:0], bw}, 0 = classic
 
     output wire [1:0]          r,
     output wire [1:0]          g,
@@ -157,10 +158,41 @@ module pixel_gen #(
   wire [1:0] top = band[BAND_W-1:BAND_W-2];
   wire [1:0] lvl = (top == 2'b00) ? 2'b01 : top;
 
-  // ---- per-group hue: bass red, low-mid magenta, high-mid cyan, highs green ----
-  wire hue_r = in_bottom | in_left;
-  wire hue_g = in_right  | in_centre;
-  wire hue_b = in_left   | in_right;
+  // ---- config: firmware-selectable look, fetched with visual_state each vblank ----
+  // ALL-ZERO means "behave exactly as before" -- classic palette, colour, full brightness.
+  // An unwritten MCU config region reads back 0, so firmware that only publishes bands
+  // still gets a normal picture. That is why brightness is a DIM amount, not a CAP.
+  wire       cfg_bw   = cfg[0];
+  wire [1:0] cfg_pal  = cfg[2:1];
+  wire [1:0] cfg_cap  = 2'd3 - cfg[4:3];        // dim 0 -> cap 3 (full), dim 3 -> cap 0
+
+  // ---- hue: one of four palettes, indexed by [palette][group] ----
+  // group: 0 bass, 1 low-mid, 2 high-mid, 3 highs. Palette 0 is the original scheme.
+  // With 1 bit per channel there are 7 usable hues: R G B, yellow, magenta, cyan, white.
+  wire [1:0] group = in_bottom ? 2'd0 : in_left ? 2'd1 : in_right ? 2'd2 : 2'd3;
+
+  reg [2:0] pal_hue;
+  always @(*) begin
+    case ({cfg_pal, group})
+      // palette 0 -- classic: red / magenta / cyan / green
+      4'b00_00: pal_hue = 3'b100;  4'b00_01: pal_hue = 3'b101;
+      4'b00_10: pal_hue = 3'b011;  4'b00_11: pal_hue = 3'b010;
+      // palette 1 -- ice: blue / cyan / white / cyan
+      4'b01_00: pal_hue = 3'b001;  4'b01_01: pal_hue = 3'b011;
+      4'b01_10: pal_hue = 3'b111;  4'b01_11: pal_hue = 3'b011;
+      // palette 2 -- fire: red / yellow / white / yellow
+      4'b10_00: pal_hue = 3'b100;  4'b10_01: pal_hue = 3'b110;
+      4'b10_10: pal_hue = 3'b111;  4'b10_11: pal_hue = 3'b110;
+      // palette 3 -- neon: magenta / blue / green / white
+      4'b11_00: pal_hue = 3'b101;  4'b11_01: pal_hue = 3'b001;
+      4'b11_10: pal_hue = 3'b010;  default:  pal_hue = 3'b111;
+    endcase
+  end
+
+  wire [2:0] hue = cfg_bw ? 3'b111 : pal_hue;   // B&W: drive all three channels equally
+  wire hue_r = hue[2];
+  wire hue_g = hue[1];
+  wire hue_b = hue[0];
 
   wire [1:0] zr = (lit && hue_r) ? lvl : 2'b00;
   wire [1:0] zg = (lit && hue_g) ? lvl : 2'b00;
@@ -183,9 +215,14 @@ module pixel_gen #(
   wire [2:0] gsum = {1'b0, zg} + {1'b0, fl};
   wire [2:0] bsum = {1'b0, zb} + {1'b0, fl};
 
-  wire [1:0] rsat = rsum[2] ? 2'b11 : rsum[1:0];
-  wire [1:0] gsat = gsum[2] ? 2'b11 : gsum[1:0];
-  wire [1:0] bsat = bsum[2] ? 2'b11 : bsum[1:0];
+  // Saturate to the CONFIGURED ceiling rather than a fixed 3. At cfg_cap == 3 this is
+  // identical to plain 2-bit saturation, so the default path is unchanged; below that it
+  // dims the flash as well as the zones -- a "global brightness cap" the kick punched
+  // straight through would not be much of a cap.
+  wire [2:0] cap_e = {1'b0, cfg_cap};
+  wire [1:0] rsat  = (rsum > cap_e) ? cfg_cap : rsum[1:0];
+  wire [1:0] gsat  = (gsum > cap_e) ? cfg_cap : gsum[1:0];
+  wire [1:0] bsat  = (bsum > cap_e) ? cfg_cap : bsum[1:0];
 
   // ---- blanking gate: light in the porches makes a monitor refuse to lock ----
   assign r = active ? rsat : 2'b00;

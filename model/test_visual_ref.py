@@ -205,6 +205,95 @@ def test_wobble_never_overflows_its_zone_visibly():
         assert V.BAND_MAX * mul + V.WOBBLE_MAX < depth + 2 * mul + V.WOBBLE_MAX + 1
 
 
+def test_cfg_zero_is_the_original_design():
+    """THE safety property. An unwritten MCU config region reads back 0, so firmware that
+    only publishes bands must still get a normal picture. cfg == 0 must therefore mean
+    classic palette, full colour, full brightness -- which is why brightness is encoded as
+    a DIM amount, not a CAP (a cap of 0 would blank the screen)."""
+    bw, palette, cap = V.cfg_fields(0)
+    assert (bw, palette, cap) == (0, 0, 3), (bw, palette, cap)
+    assert V.PALETTES[0] == [V.HUE_BASS, V.HUE_LOWMID, V.HUE_HIMID, V.HUE_HIGH]
+    # and the rendered result is unchanged across the screen
+    for py in range(0, V.V_VIS, 31):
+        for px in range(0, V.H_VIS, 41):
+            a = V.pixel(px, py, True, V.DEFAULT_BANDS, 7, 40)
+            b = V.pixel(px, py, True, V.DEFAULT_BANDS, 7, 40, cfg=0)
+            assert a == b, (px, py, a, b)
+
+
+def test_bw_makes_every_lit_pixel_grey():
+    cfg = 1 << V.CFG_BW_BIT
+    seen = 0
+    for py in range(0, V.V_VIS, 13):
+        for px in range(0, V.H_VIS, 17):
+            r, g, b = V.pixel(px, py, True, V.DEFAULT_BANDS, 0, 0, cfg)
+            assert r == g == b, "not grey at ({},{}): {}".format(px, py, (r, g, b))
+            seen += (r != 0)
+    assert seen > 0, "B&W mode lit nothing at all"
+
+
+def test_dim_reduces_brightness_monotonically():
+    """Higher dim must never make anything brighter, and dim = 3 must be fully black."""
+    prev = None
+    for dim in range(4):
+        cfg = dim << V.CFG_DIM_SHIFT
+        peak = 0
+        for py in range(0, V.V_VIS, 19):
+            for px in range(0, V.H_VIS, 23):
+                peak = max(peak, max(V.pixel(px, py, True, ALL_FULL, 31, 0, cfg)))
+        if prev is not None:
+            assert peak <= prev, "dim {} is brighter than dim {}".format(dim, dim - 1)
+        prev = peak
+    assert prev == 0, "dim = 3 must black the screen, peak was {}".format(prev)
+
+
+def test_cap_also_dims_the_kick_flash():
+    """A 'global brightness cap' the kick punched straight through would not be a cap."""
+    full = V.pixel(400, 100, True, ALL_OFF, 31, 0, cfg=0)
+    assert full == (3, 3, 3), full
+    dimmed = V.pixel(400, 100, True, ALL_OFF, 31, 0, cfg=(1 << V.CFG_DIM_SHIFT))
+    assert max(dimmed) == 2, dimmed
+
+
+def test_each_palette_is_distinct_and_legal():
+    assert len(V.PALETTES) == 4
+    for pi, pal in enumerate(V.PALETTES):
+        assert len(pal) == 4
+        for h in pal:
+            assert 1 <= h <= 7, "palette {} has an illegal/black hue {}".format(pi, h)
+    for pi in range(1, 4):
+        assert V.PALETTES[pi] != V.PALETTES[0], "palette {} duplicates the classic one".format(pi)
+
+
+def test_palette_select_actually_changes_colour():
+    bands = V.DEFAULT_BANDS
+    base = [V.pixel(px, py, True, bands, 0, 0, 0)
+            for py in range(0, V.V_VIS, 29) for px in range(0, V.H_VIS, 31)]
+    for pal in range(1, 4):
+        cfg = pal << V.CFG_PALETTE_SHIFT
+        other = [V.pixel(px, py, True, bands, 0, 0, cfg)
+                 for py in range(0, V.V_VIS, 29) for px in range(0, V.H_VIS, 31)]
+        assert other != base, "palette {} renders identically to palette 0".format(pal)
+
+
+def test_config_never_lights_a_silent_band():
+    """No config combination may break the mostly-black default."""
+    for cfg in range(1 << V.BAND_W):
+        for (px, py) in [(100, 599), (0, 0), (400, 10), (799, 200), (260, 5)]:
+            assert V.pixel(px, py, True, ALL_OFF, 0, 77, cfg) == (0, 0, 0), (cfg, px, py)
+
+
+def test_visual_state_carries_cfg():
+    st = V.VisualState()
+    assert st.cfg == 0
+    st.write(V.VisualState.ADDR_CFG, 0b10101)
+    assert st.cfg == 0b10101
+    st.write(V.VisualState.ADDR_CFG + 1, 0b11111)      # reserved -> inert
+    assert st.cfg == 0b10101
+    st.reset()
+    assert st.cfg == 0
+
+
 def _main():
     checks = [test_every_pixel_maps_to_exactly_one_zone,
               test_zone_groups_land_in_the_right_regions,
@@ -221,7 +310,15 @@ def _main():
               test_silence_stays_black_at_every_frame,
               test_animation_actually_moves,
               test_render_is_deterministic,
-              test_wobble_never_overflows_its_zone_visibly]
+              test_wobble_never_overflows_its_zone_visibly,
+              test_cfg_zero_is_the_original_design,
+              test_bw_makes_every_lit_pixel_grey,
+              test_dim_reduces_brightness_monotonically,
+              test_cap_also_dims_the_kick_flash,
+              test_each_palette_is_distinct_and_legal,
+              test_palette_select_actually_changes_colour,
+              test_config_never_lights_a_silent_band,
+              test_visual_state_carries_cfg]
     print("SeeTheBeat visual back-end golden-model self-check")
     print("-" * 58)
     ok = 0
