@@ -102,7 +102,13 @@ def test_animation_constants_match():
     """The breathing effect's constants live in both places too, so guard them the same way
     -- a FRAME_W mismatch would change the breathing period without any test noticing."""
     _cmp(PIXEL_GEN, "FRAME_W", V.FRAME_W, "pixel_gen.v")
-    _cmp(PIXEL_GEN, "WOBBLE_MAX", V.WOBBLE_MAX, "pixel_gen.v")
+    # WOBBLE_MAX is deliberately NOT an RTL parameter -- the ceiling is implied by the
+    # config field width. Check the model derives it that way, so the two stay coherent.
+    assert V.WOBBLE_MAX == ((1 << V.BAND_W) - 1) * V.WOBBLE_STEP, (
+        "model WOBBLE_MAX {} is not what a {}-bit cfg2 in {}-px units can reach".format(
+            V.WOBBLE_MAX, V.BAND_W, V.WOBBLE_STEP))
+    assert "WOBBLE_MAX" not in PIXEL_GEN, (
+        "pixel_gen.v has a WOBBLE_MAX parameter again -- it can only be dead logic")
 
 
 def test_visual_state_shape_matches():

@@ -50,7 +50,6 @@ module pixel_gen #(
     parameter PXW     = 11,           // width of px (vga_timing's HW)
     parameter PYW     = 10,           // width of py (vga_timing's VW)
     parameter FRAME_W = 8,            // frame-counter width (wraps every 256 frames)
-    parameter WOBBLE_MAX = 63,        // HARD CEILING on the breathing amplitude, px
     // ---- DERIVED -- do not override ----
     parameter integer ZW = $clog2(NBANDS)
 ) (
@@ -158,9 +157,13 @@ module pixel_gen #(
   // comparator, and a low setting reads as a swell that reaches its cap and holds.
   // cfg2 == 0 means no breathing, which is a legitimate setting and where an unwritten
   // config region leaves the chip.
-  wire [BAND_W:0] amp_raw = {cfg2, 1'b0};                   // cfg2 * 2, exact width
-  wire [5:0] amp_cap = (amp_raw > WOBBLE_MAX[BAND_W:0]) ? WOBBLE_MAX[5:0] : amp_raw;
-  wire [5:0] wob     = (tri_wave > amp_cap) ? amp_cap : tri_wave;
+  // No separate ceiling parameter: the maximum amplitude is already implied by the config
+  // field width -- a 5-bit cfg2 in 2-pixel units reaches 62 px, and the triangle spans 63.
+  // An explicit WOBBLE_MAX could only ever be >= 62, which made its clamp dead logic
+  // (Verilator CMPCONST) -- and removing the clamp then made the parameter unused. The
+  // encoding is the ceiling; model/visual_ref.py derives WOBBLE_MAX the same way.
+  wire [BAND_W:0] amp = {cfg2, 1'b0};                       // cfg2 * 2, exact width, 0..62
+  wire [5:0] wob = (tri_wave > amp) ? amp : tri_wave;       // clip the triangle to it
 
   // A SILENT band must stay perfectly black: the wobble may only extend a bar that is
   // already lit, never light one that should be dark. Without this guard the whole screen

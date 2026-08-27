@@ -92,7 +92,7 @@ MUL_CENTRE = 12
 # Here the fill threshold gains a small time-varying offset, so each bar's tip drifts in and
 # out by a few pixels: the picture breathes instead of sitting still between beats.
 FRAME_W = 8                     # frame counter width (wraps every 256 frames ~ 4.3 s)
-WOBBLE_MAX = 63                 # HARD CEILING in silicon; firmware picks the value below it
+WOBBLE_STEP = 2                 # config units are 2 px, so a 5-bit field reaches 0..62
 # History worth keeping: the first version used 7 px, and the whole breathing range was then
 # SMALLER than a single band increment in the bass (8 px) and centre (12 px) zones -- 82% of
 # the screen -- so the effect sat below the quantisation of the thing it modulates and was
@@ -102,7 +102,11 @@ WOBBLE_MAX = 63                 # HARD CEILING in silicon; firmware picks the va
 # The amplitude is now FIRMWARE-CONTROLLED (config word 18) rather than a fixed parameter,
 # because a value you cannot retune after tape-out is a value you will get wrong. 63 is only
 # the ceiling the hardware can express.
-WOBBLE_STEP = 2                 # config units are 2 px, so 5 bits reach 0..62
+# WOBBLE_MAX is DERIVED, not chosen: the ceiling is whatever the config field can ask for.
+# An independent ceiling parameter in the RTL was dead logic -- it could only ever be >= the
+# field's maximum, so its clamp never fired (Verilator CMPCONST), and deleting the clamp
+# then left the parameter unused. The encoding IS the ceiling.
+WOBBLE_MAX = ((1 << BAND_W) - 1) * WOBBLE_STEP   # 62 px
 
 def wobble(frame, amp_cfg=0):
     """A triangle wave on the frame counter: 0 -> 7 -> 0 over 256 frames (~4.3 s at 60 Hz).
@@ -122,7 +126,7 @@ def wobble(frame, amp_cfg=0):
     """
     phase = (frame >> 1) & 0x7F                  # advance every 2 frames, 128 steps
     tri = (63 - (phase & 0x3F)) if (phase & 0x40) else (phase & 0x3F)   # 0..63
-    cap = min(amp_cfg * WOBBLE_STEP, WOBBLE_MAX)
+    cap = amp_cfg * WOBBLE_STEP                  # 0..62, mirroring {cfg2, 1'b0}
     return cap if tri > cap else tri
 
 # ---- per-group hue as a 3-bit mask {r, g, b} ----
