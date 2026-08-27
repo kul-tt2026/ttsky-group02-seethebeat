@@ -145,6 +145,14 @@ module pixel_gen #(
   //      artefact). Firmware owns the decay. ----
   wire [1:0] fl = flash[FLASH_W-1:FLASH_W-2];
 
+  // Only the top 2 bits of `flash` can ever reach a pin: the Pmod has 4 levels per channel,
+  // so there is nothing finer to display. The low bits are still carried because firmware
+  // runs its decay envelope at full resolution and publishes the whole value, and because
+  // the planned fade + ordered-dither upgrade (PART2) consumes them without needing a
+  // visual_state change. Sinking them explicitly, per CLAUDE.md sec.7 -- never a global waiver.
+  // (Assumes FLASH_W >= 3, which visual_state's elaboration guard already enforces.)
+  wire _unused_flash = &{1'b0, flash[FLASH_W-3:0]};
+
   wire [2:0] rsum = {1'b0, zr} + {1'b0, fl};
   wire [2:0] gsum = {1'b0, zg} + {1'b0, fl};
   wire [2:0] bsum = {1'b0, zb} + {1'b0, fl};
