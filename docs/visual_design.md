@@ -164,7 +164,7 @@ The pin *names* are the trap — the pin labelled `R1` carries `r[1]`, the MSB. 
 ## 5. Refresh timing
 
 `vga_timing` emits `frame_start`, a one-clock pulse at the beginning of vertical blanking.
-That asks `fft_ctrl` — the chip's single bus master — to stream 17 `CFGRD`s and write each
+That asks `fft_ctrl` — the chip's single bus master — to stream 19 `CFGRD`s and write each
 returned value into `visual_state`.
 
 - Blanking is **183,168 clocks per frame** (27.6 % of 663,168); the refresh needs well under

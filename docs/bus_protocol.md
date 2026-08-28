@@ -165,7 +165,7 @@ response on `ui_in`/`resp_valid`, same in-order pipelining and the same
 `MAX_OUTSTANDING = 4`. Only the opcode nibble differs, so the MCU-side PIO can share one
 capture datapath and simply branch on the opcode when servicing.
 
-**The config region layout (v1)** — 17 words, one value per word, low bits only:
+**The config region layout (v1)** — 19 words, one value per word, low bits only:
 
 | CFG addr | Meaning | Bits used |
 | --- | --- | --- |

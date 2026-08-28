@@ -38,7 +38,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import mcu_bus_model as bus   # noqa: E402
 import fft_ref                # noqa: E402
 import visual_ref             # noqa: E402
-import visual_ref             # noqa: E402
 
 
 # EVERYTHING RUNS AS ONE @cocotb.test(). Two separate tests each starting their own Clock
@@ -252,3 +251,26 @@ async def _check_visual_state_refresh(dut, st, N):
 
     await _wait_done(dut)
     _check(st["slave"], x, N)                   # and the FFT result is still bit-exact
+
+    # ---- a start that lands DURING a refresh must be LATCHED, not dropped ----
+    # `start` is a one-cycle pulse from the frame-ready edge and is only acted on in S_IDLE.
+    # Before start_pending existed, a frame-ready arriving while the once-per-frame refresh
+    # was in flight was silently lost -- and since neither `done` nor `busy` reaches a pin,
+    # the MCU would have waited forever for a transform that never began. The refresh window
+    # is invisible to the MCU, so it cannot avoid this by timing.
+    x2 = _fullscale(N)
+    sl2 = _load(N, x2, 2)
+    for a in range(VS_WORDS):
+        sl2.cfg[a] = (a * 5 + 2) & 31
+    st["slave"] = sl2
+    st["stalled"] = False
+    await _reset(dut)
+
+    dut.refresh_req.value = 1
+    await RisingEdge(dut.clk)
+    dut.refresh_req.value = 0
+    await ClockCycles(dut.clk, 6)               # refresh is now well in flight
+    await _go(dut)                              # ... and the frame-ready edge lands here
+    await _wait_done(dut, limit=200000)         # it must still run to completion
+    _check(sl2, x2, N)                          # and be bit-exact -- the start was queued
+                                                # behind the refresh, not lost to it

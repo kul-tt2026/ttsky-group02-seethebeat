@@ -127,6 +127,10 @@ def test_refresh_fetches_every_config_word():
     a way that looked like an RTL bug; this catches that drift directly."""
     want = V.CFG2_ADDR + 1
     _cmp(FFT_CTRL, "VS_N", want, "fft_ctrl.v")
+    # VS_W is how many bits of each fetched word reach visual_state, so it must track
+    # BAND_W. The documented area-reduction ladder lists "fewer bits per band 8 -> 4" as a
+    # lever, which would change BAND_W and silently truncate every value if VS_W lagged.
+    _cmp(FFT_CTRL, "VS_W", V.BAND_W, "fft_ctrl.v")
     assert V.VisualState.ADDR_CFG2 == V.CFG2_ADDR
     assert V.CFG2_ADDR == V.CFG_ADDR + 1 == V.NBANDS + 2, "config address map is not contiguous"
 
