@@ -49,7 +49,7 @@ import visual_ref             # noqa: E402
 #
 # how many words a refresh fetches -- derived from the model so it cannot go stale when a
 # config word is added (test_geometry_sync checks fft_ctrl.v's VS_N against the same value)
-VS_WORDS = visual_ref.CFG2_ADDR + 1
+VS_WORDS = visual_ref.CFG3_ADDR + 1
 
 
 def _signed(v):

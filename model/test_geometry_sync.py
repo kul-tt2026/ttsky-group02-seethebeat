@@ -125,14 +125,21 @@ def test_refresh_fetches_every_config_word():
     address the model defines -- 16 bands + flash + both config words. When cfg2 was added
     and VS_N went 18 -> 19, a cocotb test still hardcoding 17 words went stale and failed in
     a way that looked like an RTL bug; this catches that drift directly."""
-    want = V.CFG2_ADDR + 1
+    want = V.CFG3_ADDR + 1
     _cmp(FFT_CTRL, "VS_N", want, "fft_ctrl.v")
     # VS_W is how many bits of each fetched word reach visual_state, so it must track
     # BAND_W. The documented area-reduction ladder lists "fewer bits per band 8 -> 4" as a
     # lever, which would change BAND_W and silently truncate every value if VS_W lagged.
     _cmp(FFT_CTRL, "VS_W", V.BAND_W, "fft_ctrl.v")
     assert V.VisualState.ADDR_CFG2 == V.CFG2_ADDR
+    assert V.VisualState.ADDR_CFG3 == V.CFG3_ADDR
     assert V.CFG2_ADDR == V.CFG_ADDR + 1 == V.NBANDS + 2, "config address map is not contiguous"
+    assert V.CFG3_ADDR == V.CFG2_ADDR + 1, "config address map is not contiguous"
+    # The register file must actually decode every address the refresh fetches, or the last
+    # word is streamed into nothing and the feature is silently dead in silicon.
+    for name, addr in (("ADDR_CFG", V.CFG_ADDR), ("ADDR_CFG2", V.CFG2_ADDR),
+                       ("ADDR_CFG3", V.CFG3_ADDR)):
+        _cmp(VISUAL_STATE, name, addr, "visual_state.v")
 
 
 def test_every_zone_can_actually_fill():

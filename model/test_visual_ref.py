@@ -331,6 +331,174 @@ def test_visual_state_carries_cfg():
     assert st.cfg == 0
 
 
+# ============================ soft fade + ordered dither ============================
+
+def test_bayer_is_the_canonical_matrix():
+    """The closed form {v0, y0, v1, y1} with v = px^py MUST equal the standard 4x4 Bayer
+    matrix -- that identity is the entire reason the dither costs two XOR gates instead of a
+    16-entry LUT. If it ever stops holding, the effect is not a Bayer dither any more, it is
+    just noise with a nice comment."""
+    canon = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]]
+    for py in range(4):
+        for px in range(4):
+            assert V.bayer4(px, py) == canon[py][px], (px, py)
+    # every threshold used exactly once per cell -> an even spatial average, not a clump
+    cell = sorted(V.bayer4(px, py) for py in range(4) for px in range(4))
+    assert cell == list(range(16))
+    # and it tiles: only the low 2 bits of each coordinate matter
+    for py in range(0, V.V_VIS, 37):
+        for px in range(0, V.H_VIS, 41):
+            assert V.bayer4(px, py) == V.bayer4(px & 3, py & 3)
+
+
+def test_cfg3_zero_is_the_original_design():
+    """The all-zero rule, again: an unwritten MCU config region reads back 0, so cfg3 == 0
+    must render EXACTLY the hard-edged picture that existed before the fade did. Checked
+    over the whole frame, not a sample."""
+    bands = [(i * 2 + 3) & V.BAND_MAX for i in range(V.NBANDS)]
+    for py in range(V.V_VIS):
+        for px in range(V.H_VIS):
+            a = V.pixel(px, py, True, bands, 0, frame=11, cfg=0, cfg2=4, cfg3=0)
+            b = V.pixel(px, py, True, bands, 0, frame=11, cfg=0, cfg2=4)
+            assert a == b, (px, py, a, b)
+
+
+def test_fade_never_brightens_and_never_overflows():
+    """The fade may only ever take brightness AWAY. If it could add, a bar tip would be
+    brighter than the bar, and the 2-bit channel could wrap -- which on this Pmod reads as
+    a black notch at the tip, the most visible artefact available."""
+    bands = [V.BAND_MAX] * V.NBANDS
+    for sh in range(4):
+        cfg3 = 1 | (sh << V.CFG3_FADE_SH_SHIFT)
+        for py in range(0, V.V_VIS, 3):
+            for px in range(0, V.H_VIS, 3):
+                hard = V.pixel(px, py, True, bands, 0, cfg3=0)
+                soft = V.pixel(px, py, True, bands, 0, cfg3=cfg3)
+                for c in range(3):
+                    assert 0 <= soft[c] <= 3, (px, py, sh, soft)
+                    assert soft[c] <= hard[c], (px, py, sh, soft, hard)
+
+
+def test_fade_level_arithmetic_cannot_exceed_three():
+    """Exhaustive over the whole (lvl, tip_dist, pixel-phase, shift) space that matters, so
+    the RTL can carry `whole` in 2 bits with no saturation logic of its own. `whole == 3`
+    is reachable only at scaled == 48, where the fraction is 0 and the dither bump cannot
+    fire -- this proves that rather than asserting it in a comment."""
+    for lvl in (1, 2, 3):
+        for sh in range(4):
+            for d in range(0, (V.FADE_STEPS << sh) * 2 + 4):
+                for py in range(4):
+                    for px in range(4):
+                        out = V.fade_level(lvl, d, px, py, sh)
+                        assert 0 <= out <= 3, (lvl, d, px, py, sh, out)
+                        assert out <= lvl, "fade brightened a pixel"
+
+
+def test_fade_reaches_full_brightness_away_from_the_tip():
+    """Past the ramp the bar must be at its ordinary brightness -- the fade is a tip
+    treatment, not a global dimmer. Anything else would make the whole picture darker as
+    soon as firmware enables it."""
+    for lvl in (1, 2, 3):
+        for sh in range(4):
+            w = V.fade_width(sh)
+            for d in (w, w + 1, w * 3, 900):
+                for py in range(4):
+                    for px in range(4):
+                        assert V.fade_level(lvl, d, px, py, sh) == lvl, (lvl, d, sh)
+
+
+def test_fade_ramp_is_monotonic_along_the_bar():
+    """Averaged over a 4x4 dither cell, brightness must rise monotonically from the tip
+    inward. A non-monotonic ramp would read as banding -- the exact artefact the dither is
+    there to remove."""
+    for lvl in (1, 2, 3):
+        for sh in range(4):
+            prev = -1.0
+            for d in range(0, V.fade_width(sh) + 1):
+                cell = sum(V.fade_level(lvl, d, px, py, sh)
+                           for py in range(4) for px in range(4)) / 16.0
+                assert cell >= prev - 1e-9, (lvl, sh, d, cell, prev)
+                prev = cell
+
+
+def test_dither_actually_buys_intermediate_levels():
+    """The point of the whole effect: inside the ramp, a 4x4 cell must show MORE distinct
+    average brightnesses than the four the Pmod can express. If this fails the dither is
+    doing nothing and the gates are wasted."""
+    sh = 1
+    seen = set()
+    for d in range(0, V.fade_width(sh) + 1):
+        cell = sum(V.fade_level(3, d, px, py, sh) for py in range(4) for px in range(4))
+        seen.add(cell)
+    assert len(seen) >= 12, "only {} distinct cell averages -- dither is not working".format(
+        len(seen))
+
+
+def test_fade_still_leaves_a_silent_band_perfectly_black():
+    """The invariant that outranks every effect: silence is black. The fade only ever
+    reduces a LIT pixel, so it cannot break this -- prove it rather than assume it."""
+    for sh in range(4):
+        cfg3 = 1 | (sh << V.CFG3_FADE_SH_SHIFT)
+        for f in (0, 7, 64, 200):
+            for py in range(0, V.V_VIS, 7):
+                for px in range(0, V.H_VIS, 11):
+                    assert V.pixel(px, py, True, ALL_OFF, 0, frame=f, cfg2=31,
+                                   cfg3=cfg3) == (0, 0, 0), (px, py, sh, f)
+
+
+def test_fade_respects_blanking():
+    for sh in range(4):
+        cfg3 = 1 | (sh << V.CFG3_FADE_SH_SHIFT)
+        for py in range(0, V.V_VIS, 13):
+            for px in range(0, V.H_VIS, 17):
+                assert V.pixel(px, py, False, ALL_FULL, 31, cfg3=cfg3) == (0, 0, 0)
+
+
+def test_fade_width_settings_are_powers_of_two():
+    """Powers of two ONLY. The preview normalised by 24, which needs a divider -- there is
+    no divider on this chip and no room for one. Restricting the ramp to powers of two makes
+    the normalisation a wire slice."""
+    assert [V.fade_width(s) for s in range(4)] == [16, 32, 64, 128]
+    for sh in range(4):
+        w = V.fade_width(sh)
+        assert w & (w - 1) == 0, "fade width {} is not a power of two".format(w)
+
+
+def test_wider_fade_is_softer():
+    """A larger fade_sh must dim MORE of the bar, or the knob does nothing useful."""
+    bands = [V.BAND_MAX] * V.NBANDS
+    dark = []
+    for sh in range(4):
+        cfg3 = 1 | (sh << V.CFG3_FADE_SH_SHIFT)
+        n = 0
+        for py in range(0, V.V_VIS, 2):
+            for px in range(0, V.H_VIS, 2):
+                hard = V.pixel(px, py, True, bands, 0, cfg3=0)
+                soft = V.pixel(px, py, True, bands, 0, cfg3=cfg3)
+                if soft != hard:
+                    n += 1
+        dark.append(n)
+    assert dark == sorted(dark) and dark[0] > 0 and dark[-1] > dark[0], dark
+
+
+def test_visual_state_carries_cfg3():
+    vs = V.VisualState()
+    assert vs.cfg3 == 0, "cfg3 must power up at 0 -- the no-fade look"
+    vs.write(V.VisualState.ADDR_CFG3, 0b101)
+    assert vs.cfg3 == 0b101
+    vs.write(V.VisualState.ADDR_CFG3, 0xFF)
+    assert vs.cfg3 == V.BAND_MAX, "cfg3 must mask to BAND_W bits"
+    vs.write(V.CFG3_ADDR + 1, 0x1F)
+    assert vs.cfg3 == V.BAND_MAX, "addresses above CFG3 must be ignored"
+
+
+def test_config_map_stays_contiguous():
+    """The refresh streams words 0..VS_N-1 in one burst, so a hole in the address map would
+    silently fetch a reserved word into a real register."""
+    assert V.CFG3_ADDR == V.CFG2_ADDR + 1 == V.NBANDS + 3
+    assert V.VisualState.ADDR_CFG3 == V.CFG3_ADDR
+
+
 def _main():
     checks = [test_every_pixel_maps_to_exactly_one_zone,
               test_zone_groups_land_in_the_right_regions,
@@ -357,7 +525,20 @@ def _main():
               test_palette_select_actually_changes_colour,
               test_config_never_lights_a_silent_band,
               test_visual_state_carries_cfg,
-              test_visual_state_carries_cfg2]
+              test_visual_state_carries_cfg2,
+              test_bayer_is_the_canonical_matrix,
+              test_cfg3_zero_is_the_original_design,
+              test_fade_never_brightens_and_never_overflows,
+              test_fade_level_arithmetic_cannot_exceed_three,
+              test_fade_reaches_full_brightness_away_from_the_tip,
+              test_fade_ramp_is_monotonic_along_the_bar,
+              test_dither_actually_buys_intermediate_levels,
+              test_fade_still_leaves_a_silent_band_perfectly_black,
+              test_fade_respects_blanking,
+              test_fade_width_settings_are_powers_of_two,
+              test_wider_fade_is_softer,
+              test_visual_state_carries_cfg3,
+              test_config_map_stays_contiguous]
     print("SeeTheBeat visual back-end golden-model self-check")
     print("-" * 58)
     ok = 0

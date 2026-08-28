@@ -162,6 +162,88 @@ CFG_PALETTE_SHIFT = 1           # bits [2:1]
 CFG_DIM_SHIFT = 3               # bits [4:3], 0 = full brightness
 
 
+CFG3_ADDR = NBANDS + 3          # 19: soft fade + ordered dither
+
+# ---- config word 3 (CFG address 19): the SOFT FADE + ORDERED DITHER ----
+# Layout keeps the all-zero rule: cfg3 == 0 is fade off, i.e. the hard-edged bar exactly as
+# it was before this existed.
+#   bit 0    fade_en   1 = soften the bar tip
+#   bits 2:1 fade_sh   fade depth = FADE_STEPS << fade_sh px, i.e. 16 / 32 / 64 / 128
+#   bits 4:3 reserved, must read 0
+CFG3_FADE_EN_BIT = 0
+CFG3_FADE_SH_SHIFT = 1
+FADE_STEPS = 16                 # fractional resolution carried into the dither
+
+def cfg3_fields(cfg3):
+    """Unpack the 5-bit fade config -> (fade_en, fade_sh)."""
+    return (cfg3 >> CFG3_FADE_EN_BIT) & 1, (cfg3 >> CFG3_FADE_SH_SHIFT) & 0b11
+
+
+def fade_width(fade_sh):
+    """How many pixels the fade ramp spans. Powers of two ONLY.
+
+    The preview used 24 px, which reads well but needs a DIVIDE to normalise -- and there is
+    no divider on this chip, nor room for one. Restricting the ramp to powers of two turns
+    the normalisation into `edge >> fade_sh`, which is a slice of wires. 24 sits between the
+    16 and 32 settings; firmware picks whichever looks right on the actual monitor.
+    """
+    return FADE_STEPS << fade_sh
+
+
+def bayer4(px, py):
+    """The 4x4 ordered-dither threshold for this pixel, 0..15.
+
+    This is the standard Bayer matrix
+
+           0  8  2 10
+          12  4 14  6
+           3 11  1  9
+          15  7 13  5
+
+    but NOT stored as a table. The Bayer construction has a closed form -- interleave the
+    bits of (y XOR x) with those of y, then reverse -- which for the 4x4 case collapses to
+    the 4-bit value {v0, y0, v1, y1} with v = px ^ py. In hardware that is TWO XOR GATES AND
+    SOME WIRES, where a 16-entry LUT with a 4-bit output would have been a real mux. It is
+    the single reason this effect is affordable.
+
+    Each of the 16 thresholds occurs exactly once per 4x4 cell, which is what makes the
+    dither an even spatial average rather than a clump.
+    """
+    v = (px ^ py) & 0b11
+    y = py & 0b11
+    return ((v & 1) << 3) | ((y & 1) << 2) | (((v >> 1) & 1) << 1) | ((y >> 1) & 1)
+
+
+def fade_level(lvl, tip_dist, px, py, fade_sh):
+    """Soften a lit pixel near the bar's tip. Returns the dithered level, 0..3.
+
+    WHY THIS IS WORTH GATES. The Pmod gives 2 bits per channel -- four levels, one of which
+    is black -- so a bar has exactly three brightnesses and its tip is a hard step. Fading
+    the last stretch of the bar would ordinarily just move that step around. Ordered
+    dithering resolves the fractional part SPATIALLY instead: carry 4 extra fractional bits
+    and light a pixel one level brighter when its fraction beats that pixel's Bayer
+    threshold. Averaged over a 4x4 cell that is ~16 apparent levels out of 4 real ones, so
+    the tip reads as a gradient rather than a cliff.
+
+    `tip_dist` is how far INSIDE the bar the pixel is (fill - depth), so 1 at the very tip
+    and growing toward the bar's base.
+
+    Note a lit pixel CAN come out at level 0 here -- that is the fade, not a bug, and it is
+    the one place the "a lit pixel is never level 0" rule of level_of() is deliberately
+    relaxed. It does mean a very quiet band (whose whole bar is shorter than the ramp) gets
+    dimmer than it used to: firmware can pick a narrower fade_sh, or turn the fade off.
+    """
+    f = tip_dist >> fade_sh
+    if f > FADE_STEPS:
+        f = FADE_STEPS                       # the ramp is flat once past its width
+    scaled = lvl * f                         # 0..48; lvl is 1..3 so this is a shift + add
+    whole = scaled >> 4
+    frac = scaled & 0xF
+    # whole == 3 only at scaled == 48, where frac == 0 and the bump cannot fire, so the
+    # result never exceeds 3 and needs no saturation of its own.
+    return whole + (1 if frac > bayer4(px, py) else 0)
+
+
 def cfg_fields(cfg):
     """Unpack the 5-bit config register -> (bw, palette, cap)."""
     bw = (cfg >> CFG_BW_BIT) & 1
@@ -229,17 +311,18 @@ def _cap(v, cap):
     return cap if v > cap else v
 
 
-def pixel(px, py, active, bands, flash, frame=0, cfg=0, cfg2=0):
+def pixel(px, py, active, bands, flash, frame=0, cfg=0, cfg2=0, cfg3=0):
     """The colour at (px, py) on frame `frame`. Returns (r, g, b), each 0..3.
 
-    `frame` defaults to 0 (the un-animated picture, wobble(0) == 0) and `cfg` to 0
-    (classic palette, colour, full brightness) -- so both defaults reproduce the design
-    exactly as it was before either was added.
+    `frame` defaults to 0 (the un-animated picture, wobble(0) == 0), `cfg` to 0 (classic
+    palette, colour, full brightness) and `cfg3` to 0 (hard bar tips, no fade) -- so every
+    default reproduces the design exactly as it was before that feature was added.
     """
     if not active:
         return (0, 0, 0)        # blanking MUST be black
 
     bw, palette, cap = cfg_fields(cfg)
+    fade_en, fade_sh = cfg3_fields(cfg3)
     z, depth, mul, group_hue = zone_of(px, py)
     group = z >> 2                                   # 0 bass, 1 low-mid, 2 high-mid, 3 highs
     hue = 0b111 if bw else PALETTES[palette][group]
@@ -254,6 +337,10 @@ def pixel(px, py, active, bands, flash, frame=0, cfg=0, cfg2=0):
     r = g = b = 0
     if depth < fill:                  # inside the filled part of the zone
         lvl = level_of(band)
+        # SOFT FADE + ORDERED DITHER: replace the bar's hard tip with a ramp, resolved
+        # spatially so 4 real levels read as ~16. Off by default (cfg3 == 0).
+        if fade_en:
+            lvl = fade_level(lvl, fill - depth, px, py, fade_sh)
         r = lvl if (hue >> 2) & 1 else 0
         g = lvl if (hue >> 1) & 1 else 0
         b = lvl if (hue >> 0) & 1 else 0
@@ -277,10 +364,10 @@ def pack_pmod(hsync, vsync, r, g, b):
             ((g >> 1) & 1) << 1 | ((r >> 1) & 1) << 0)
 
 
-def uo_out(hsync, vsync, px, py, active, bands, flash, frame=0, cfg=0, cfg2=0):
-    """Full path: zone -> fill(+wobble) -> palette -> flash/cap -> blanking -> Pmod."""
+def uo_out(hsync, vsync, px, py, active, bands, flash, frame=0, cfg=0, cfg2=0, cfg3=0):
+    """Full path: zone -> fill(+wobble) -> fade/dither -> palette -> flash/cap -> Pmod."""
     return pack_pmod(hsync, vsync,
-                     *pixel(px, py, active, bands, flash, frame, cfg, cfg2))
+                     *pixel(px, py, active, bands, flash, frame, cfg, cfg2, cfg3))
 
 
 class VisualState(object):
@@ -292,6 +379,7 @@ class VisualState(object):
     ADDR_FLASH = NBANDS
     ADDR_CFG = CFG_ADDR
     ADDR_CFG2 = CFG2_ADDR
+    ADDR_CFG3 = CFG3_ADDR
 
     def __init__(self):
         self.reset()
@@ -301,6 +389,7 @@ class VisualState(object):
         self.flash = DEFAULT_FLASH
         self.cfg = 0                     # all-zero = classic palette, colour, full bright
         self.cfg2 = 0                    # wobble amplitude; 0 = breathing off
+        self.cfg3 = 0                    # fade config; 0 = hard bar tips, as before
 
     def write(self, addr, data):
         if addr < NBANDS:
@@ -311,7 +400,9 @@ class VisualState(object):
             self.cfg = data & BAND_MAX
         elif addr == self.ADDR_CFG2:
             self.cfg2 = data & BAND_MAX
-        # addresses above ADDR_CFG2 are ignored (reserved for further config)
+        elif addr == self.ADDR_CFG3:
+            self.cfg3 = data & BAND_MAX
+        # addresses above ADDR_CFG3 are ignored (reserved for further config)
 
     def read_band(self, zone):
         return self.bands[zone & (NBANDS - 1)]

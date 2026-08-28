@@ -13,8 +13,8 @@
  *      and pulses done. The transform is left where the MCU wants it -- in its own memory --
  *      and firmware takes it from there: magnitude, log, band summing, beat detection and
  *      the zone colour map all run on the MCU, where they cost no silicon.
- *   2. Once per frame, at the start of vblank, the chip fetches the 19-word `visual_state`
- *      block (16 bands + flash) back from the MCU's config region and latches it. Updating
+ *   2. Once per frame, at the start of vblank, the chip fetches the 20-word `visual_state`
+ *      block (16 bands + flash + 3 config) back from the MCU's config region and latches it. Updating
  *      only during blanking is what stops a bar changing height halfway down the screen.
  *
  * Both loops are driven by fft_ctrl, which is the chip's single bus master -- see the note
@@ -51,7 +51,7 @@ module tt_um_group02_seethebeat (
   wire        active, hsync, vsync, vblank, frame_start;
   wire [1:0]  vga_r, vga_g, vga_b;
   wire [3:0]  zone;
-  wire [4:0]  band, flash, cfg, cfg2;
+  wire [4:0]  band, flash, cfg, cfg2, cfg3;
 
   // ---- the animation clock ----
   // 800x600 pixels cannot be stored, so nothing animates by being remembered. The only
@@ -73,12 +73,13 @@ module tt_um_group02_seethebeat (
   // The only visual state on the chip. Its power-on defaults draw a readable picture
   // before any firmware exists, so the output path can be validated on a monitor with
   // nothing else connected. Refreshed once per frame, in vblank: `frame_start` asks the bus master to fetch the
-  // 19 words (16 bands + flash + 2 config) from the MCU's config region. Updating only
+  // 20 words (16 bands + flash + 3 config) from the MCU's config region. Updating only
   // blanking is what keeps a bar from changing height halfway down the screen.
   visual_state u_vs (
       .clk(clk), .rst_n(rst_n),
       .wr_en(vs_wr_en), .wr_addr(vs_wr_addr), .wr_data(vs_wr_data),
-      .rd_zone(zone), .band(band), .flash(flash), .cfg(cfg), .cfg2(cfg2)
+      .rd_zone(zone), .band(band), .flash(flash),
+      .cfg(cfg), .cfg2(cfg2), .cfg3(cfg3)
   );
 
   // Combinational chain, no loop: pixel_gen decodes (px,py) -> zone, visual_state muxes
@@ -86,7 +87,8 @@ module tt_um_group02_seethebeat (
   pixel_gen u_pix (
       .clk(clk), .rst_n(rst_n),
       .px(px), .py(py), .active(active),
-      .zone(zone), .band(band), .flash(flash), .frame(frame), .cfg(cfg), .cfg2(cfg2),
+      .zone(zone), .band(band), .flash(flash), .frame(frame),
+      .cfg(cfg), .cfg2(cfg2), .cfg3(cfg3),
       .r(vga_r), .g(vga_g), .b(vga_b)
   );
 

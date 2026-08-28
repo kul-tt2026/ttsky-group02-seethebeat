@@ -11,7 +11,8 @@
  * exactly why this one piece of state cannot live on the MCU even though everything that
  * PRODUCES it does -- fetching it per pixel over the bus is impossible.
  *
- * Area: NBANDS*BAND_W + FLASH_W flops (16*5 + 5 = 85) plus a NBANDS:1 read mux. This is
+ * Area: NBANDS*BAND_W + FLASH_W + 3*BAND_W flops (16*5 + 5 + 15 = 100) plus a NBANDS:1
+ * read mux. This is
  * the single biggest area knob in Part 2, because it is raw DFFs: cost scales directly
  * with NBANDS x BAND_W. If utilisation gets tight, cut bands first, then bits -- the Pmod
  * only has 4 brightness levels per channel, so >4-5 bits per band is undisplayable anyway
@@ -46,12 +47,14 @@ module visual_state #(
     output wire [BAND_W-1:0]  band,
     output wire [FLASH_W-1:0] flash,
     output wire [BAND_W-1:0]  cfg,         // {dim[1:0], palette[1:0], bw} -- see pixel_gen
-    output wire [BAND_W-1:0]  cfg2         // breathing amplitude -- see pixel_gen
+    output wire [BAND_W-1:0]  cfg2,        // breathing amplitude -- see pixel_gen
+    output wire [BAND_W-1:0]  cfg3         // {--, fade_sh[1:0], fade_en} -- see pixel_gen
 );
 
   localparam ADDR_FLASH = NBANDS;        // 16
   localparam ADDR_CFG   = NBANDS + 1;    // 17
   localparam ADDR_CFG2  = NBANDS + 2;    // 18: breathing amplitude
+  localparam ADDR_CFG3  = NBANDS + 3;    // 19: soft fade + ordered dither
 
   // The power-on default ramp below packs the zone index into the band value as
   // {index, 1'b1}, which needs BAND_W == ZW + 1. Guard it rather than truncating silently.
@@ -72,6 +75,7 @@ module visual_state #(
   // normal picture. It is why brightness is encoded as a DIM amount rather than a CAP.
   reg [BAND_W-1:0]  cfg_r;
   reg [BAND_W-1:0]  cfg2_r;   // breathing amplitude; 0 = off
+  reg [BAND_W-1:0]  cfg3_r;   // fade/dither; 0 = hard bar tips, exactly as before
 
   integer k;
   always @(posedge clk or negedge rst_n) begin
@@ -86,6 +90,7 @@ module visual_state #(
       flash_r <= {FLASH_W{1'b0}};
       cfg_r   <= {BAND_W{1'b0}};
       cfg2_r  <= {BAND_W{1'b0}};
+      cfg3_r  <= {BAND_W{1'b0}};
     end else if (wr_en) begin
       if (wr_addr < ADDR_FLASH)
         bands[wr_addr[ZW-1:0]] <= wr_data;
@@ -95,7 +100,9 @@ module visual_state #(
         cfg_r <= wr_data;
       else if (wr_addr == ADDR_CFG2)
         cfg2_r <= wr_data;
-      // addresses above ADDR_CFG2 are ignored -- reserved for further config
+      else if (wr_addr == ADDR_CFG3)
+        cfg3_r <= wr_data;
+      // addresses above ADDR_CFG3 are ignored -- reserved for further config
     end
   end
 
@@ -103,5 +110,6 @@ module visual_state #(
   assign flash = flash_r;
   assign cfg   = cfg_r;
   assign cfg2  = cfg2_r;
+  assign cfg3  = cfg3_r;
 
 endmodule
