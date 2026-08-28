@@ -53,6 +53,10 @@ module pixel_gen #(
     // ---- DERIVED -- do not override ----
     parameter integer ZW = $clog2(NBANDS)
 ) (
+    input  wire                clk,
+    input  wire                rst_n,
+
+    // ---- STAGE 1 (combinational from px/py) ----
     input  wire [PXW-1:0]      px,
     input  wire [PYW-1:0]      py,
     input  wire                active,      // low during blanking -> forced black
@@ -64,10 +68,28 @@ module pixel_gen #(
     input  wire [BAND_W-1:0]   cfg,         // {dim[1:0], palette[1:0], bw}, 0 = classic
     input  wire [BAND_W-1:0]   cfg2,        // breathing amplitude, in 2-pixel units
 
+    // ---- STAGE 2 (one clock later) ----
     output wire [1:0]          r,
     output wire [1:0]          g,
     output wire [1:0]          b
 );
+
+  // ---- WHY THIS BLOCK IS PIPELINED ----------------------------------------------------
+  // The whole chain -- zone decode -> visual_state's 16:1 mux -> fill arithmetic -> compare
+  // -> palette -> level/cap -> flash+saturate -> pin -- used to be one combinational cone,
+  // and it was the design's critical path: the harden report named uo_out[4]/[5] (colour
+  // bits) as the worst endpoint every single time. Adding the config knobs pushed its raw
+  // slack from +0.043 ns to -0.474 ns in one batch, and Phase 5's effects target the same
+  // cone. Splitting it after the band lookup roughly halves the path for ~21 flops.
+  //
+  // The FUNCTION is unchanged -- only its timing. `project.v` delays hsync/vsync by the same
+  // one clock, so sync and colour stay aligned and the monitor sees an identical waveform
+  // shifted by 25 ns. Nothing on screen moves.
+  //
+  // `flash`, `frame`, `cfg` and `cfg2` are deliberately NOT pipelined: they are per-frame
+  // constants written during vblank, so the one-cycle skew can only ever affect a pixel
+  // inside the blanking interval, where the output is forced black anyway. Registering them
+  // would cost 23 more flops to fix something invisible.
 
   // The breathing triangle below reads phase[6] as its direction bit and phase[5:0] as the
   // ramp, i.e. it assumes a 7-bit phase == frame[FRAME_W-1:1] with FRAME_W == 8. Guard it
@@ -128,14 +150,44 @@ module pixel_gen #(
                          in_right  ? (H_LAST - px)   :      // fills leftward
                                      py_e;                  // highs HANG DOWN from py=0
 
+  // ---- the group this pixel belongs to: 0 bass, 1 left wing, 2 right wing, 3 centre.
+  //      Carried across the pipeline boundary because stage 2 needs it for both the fill
+  //      multiplier and the hue. ----
+  wire [1:0] grp = in_bottom ? 2'd0 : in_left ? 2'd1 : in_right ? 2'd2 : 2'd3;
+
+  // ======================= PIPELINE REGISTER (stage 1 -> stage 2) =======================
+  reg [BAND_W-1:0] band_q;
+  reg [PXW-1:0]    depth_q;
+  reg [1:0]        grp_q;
+  reg              active_q;
+
+  always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      band_q <= {BAND_W{1'b0}};
+      depth_q <= {PXW{1'b0}};
+      grp_q <= 2'd0;
+      active_q <= 1'b0;
+    end else begin
+      band_q <= band;              // visual_state's mux output, same cycle as `zone`
+      depth_q <= depth;
+      grp_q <= grp;
+      active_q <= active;          // the blanking gate travels with its pixel
+    end
+  end
+  // ======================================================================================
+
+  // only the two the fill multiplier needs -- the hue comes from the palette case on grp_q
+  wire s2_bottom = (grp_q == 2'd0);
+  wire s2_centre = (grp_q == 2'd3);
+
   // ---- fill threshold: depth < band * MUL, with MUL chosen per region so a full-scale
   //      band just covers that zone's depth (wings 120 -> x4, bass 240 -> x8,
   //      centre 360 -> x12). All are multiples of 4, so one shift and one adder do it --
   //      no multiplier.
-  wire [PXW-1:0] base  = {{(PXW-BAND_W-2){1'b0}}, band, 2'b00};   // band * 4
+  wire [PXW-1:0] base  = {{(PXW-BAND_W-2){1'b0}}, band_q, 2'b00};  // band * 4
   wire [PXW-1:0] base2 = {base[PXW-2:0], 1'b0};                    // band * 8
-  wire [PXW-1:0] fill_raw = in_bottom ? base2           :          // bass   x8
-                            in_centre ? (base2 + base)  :          // centre x12
+  wire [PXW-1:0] fill_raw = s2_bottom ? base2           :          // bass   x8
+                            s2_centre ? (base2 + base)  :          // centre x12
                                         base;                      // wings  x4
 
   // ---- breathing edge (Phase 1.2 / 5.2): a small time-varying offset on the fill
@@ -168,15 +220,15 @@ module pixel_gen #(
   // A SILENT band must stay perfectly black: the wobble may only extend a bar that is
   // already lit, never light one that should be dark. Without this guard the whole screen
   // would shimmer faintly through quiet passages -- the opposite of the mostly-black look.
-  wire silent = (band == {BAND_W{1'b0}});
+  wire silent = (band_q == {BAND_W{1'b0}});
   wire [PXW-1:0] fill = silent ? {PXW{1'b0}}
                                : (fill_raw + {{(PXW-6){1'b0}}, wob});
 
-  wire lit = (depth < fill);
+  wire lit = (depth_q < fill);
 
   // ---- brightness: top 2 bits of the band, but a lit pixel is never level 0, or a
   //      quiet-but-present band would draw an invisible bar and look broken. ----
-  wire [1:0] top = band[BAND_W-1:BAND_W-2];
+  wire [1:0] top = band_q[BAND_W-1:BAND_W-2];
   wire [1:0] lvl = (top == 2'b00) ? 2'b01 : top;
 
   // ---- config: firmware-selectable look, fetched with visual_state each vblank ----
@@ -190,11 +242,9 @@ module pixel_gen #(
   // ---- hue: one of four palettes, indexed by [palette][group] ----
   // group: 0 bass, 1 low-mid, 2 high-mid, 3 highs. Palette 0 is the original scheme.
   // With 1 bit per channel there are 7 usable hues: R G B, yellow, magenta, cyan, white.
-  wire [1:0] group = in_bottom ? 2'd0 : in_left ? 2'd1 : in_right ? 2'd2 : 2'd3;
-
   reg [2:0] pal_hue;
   always @(*) begin
-    case ({cfg_pal, group})
+    case ({cfg_pal, grp_q})
       // palette 0 -- classic: red / magenta / cyan / green
       4'b00_00: pal_hue = 3'b100;  4'b00_01: pal_hue = 3'b101;
       4'b00_10: pal_hue = 3'b011;  4'b00_11: pal_hue = 3'b010;
@@ -251,8 +301,8 @@ module pixel_gen #(
   wire [1:0] bsat  = (bsum > cap_e) ? cfg_cap : bsum[1:0];
 
   // ---- blanking gate: light in the porches makes a monitor refuse to lock ----
-  assign r = active ? rsat : 2'b00;
-  assign g = active ? gsat : 2'b00;
-  assign b = active ? bsat : 2'b00;
+  assign r = active_q ? rsat : 2'b00;
+  assign g = active_q ? gsat : 2'b00;
+  assign b = active_q ? bsat : 2'b00;
 
 endmodule

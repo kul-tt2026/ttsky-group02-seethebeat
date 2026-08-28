@@ -84,6 +84,7 @@ module tt_um_group02_seethebeat (
   // Combinational chain, no loop: pixel_gen decodes (px,py) -> zone, visual_state muxes
   // zone -> band, pixel_gen turns band -> colour. All inside one pixel clock.
   pixel_gen u_pix (
+      .clk(clk), .rst_n(rst_n),
       .px(px), .py(py), .active(active),
       .zone(zone), .band(band), .flash(flash), .frame(frame), .cfg(cfg), .cfg2(cfg2),
       .r(vga_r), .g(vga_g), .b(vga_b)
@@ -109,10 +110,27 @@ module tt_um_group02_seethebeat (
   assign uio_out = fft_uio_out;
   assign uio_oe  = fft_uio_oe;
 
+  // ---- sync is delayed by the SAME one clock as the pixel pipeline ----
+  // pixel_gen registers band/depth/group, so a pixel's colour emerges one clock after its
+  // coordinates. Delaying hsync/vsync by one clock too keeps them aligned with it: the
+  // monitor sees an identical waveform shifted by 25 ns, so nothing on screen moves. Get
+  // this wrong -- delay the colour but not the sync -- and the blanking gate slides
+  // relative to the picture, which is the classic way to break a VGA output.
+  reg hsync_q, vsync_q;
+  always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      hsync_q <= 1'b0;
+      vsync_q <= 1'b0;
+    end else begin
+      hsync_q <= hsync;
+      vsync_q <= vsync;
+    end
+  end
+
   // Tiny VGA Pmod packing: uo_out = {hsync, B0, G0, R0, vsync, B1, G1, R1}.
   // The pin NAMES are the trap -- the pin labelled R1 carries r[1], the MSB.
-  assign uo_out = {hsync, vga_b[0], vga_g[0], vga_r[0],
-                   vsync, vga_b[1], vga_g[1], vga_r[1]};
+  assign uo_out = {hsync_q, vga_b[0], vga_g[0], vga_r[0],
+                   vsync_q, vga_b[1], vga_g[1], vga_r[1]};
 
   // `vblank` is available for a future effect; `fft_done`/`busy` are observable on the bus
   // (the MCU knows when it last asserted frame-ready). Sink them for lint.

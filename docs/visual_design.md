@@ -7,7 +7,8 @@ Keep this file current. When `src/pixel_gen.v`, `src/visual_state.v` or
 `model/visual_ref.py` change, change this too — they are the implementation of what is
 written here, and `model/test_visual_ref.py` is what proves they agree.
 
-*Last updated: 2026-08-27 (geometry rebalance, refresh path, breathing edge, look config).*
+*Last updated: 2026-08-28 (geometry rebalance, refresh path, breathing edge, look config,
+pixel pipeline).*
 
 ---
 
@@ -154,6 +155,33 @@ For each pixel, in one clock:
 
 8. **Blanking gate** — outside the visible area the output is forced to black. Light in the
    porches makes a monitor refuse to lock or shift the image sideways.
+
+### The pixel path is PIPELINED (2026-08-28)
+
+Steps 1–8 above are split across **one register stage**, after the band lookup:
+
+```
+stage 1   (px,py) -> zone decode -> depth, group -> visual_state 16:1 mux -> band
+          ---- register: band[4:0], depth[10:0], group[1:0], active ----
+stage 2   fill (+wobble) -> compare -> palette/hue -> level/cap -> flash+saturate -> pin
+```
+
+**Why:** this chain was the design's critical path in every harden report — the worst
+endpoint was always a colour bit (`uo_out[4]`, then `uo_out[5]`). Adding the config knobs
+pushed its raw slack from +0.043 ns to −0.474 ns in a single batch, and Phase 5's effects
+target the same cone. The split roughly halves it for **21 flops**.
+
+**`hsync`/`vsync` are delayed by the same one clock** in `project.v`, so sync stays aligned
+with colour and the monitor sees an identical waveform shifted by 25 ns — nothing on screen
+moves. Delaying the colour but *not* the sync is the classic way to break a VGA output.
+
+**`flash`, `frame`, `cfg` and `cfg2` are deliberately not pipelined.** They are per-frame
+constants written during vblank, so the one-cycle skew can only touch a pixel inside the
+blanking interval, where the output is forced black anyway. Registering them would cost 23
+more flops to fix something invisible.
+
+**The function is unchanged** — only its timing. That is why `model/visual_ref.py` needs no
+pipeline of its own, and why the RTL-vs-model comparison is still bit-exact.
 
 **Output packing** (Tiny VGA Pmod): `uo_out = {hsync, B0, G0, R0, vsync, B1, G1, R1}`.
 The pin *names* are the trap — the pin labelled `R1` carries `r[1]`, the MSB. Colour is
