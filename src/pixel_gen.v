@@ -12,6 +12,11 @@
  * "energy bloom"), and the top bits of the band set its brightness. A silent band is
  * black -- the mostly-black default.
  *
+ * The bar tip can be softened by a FADE + 4x4 ORDERED DITHER (config word 19, off by
+ * default) -- the trick that gets ~16 apparent brightness levels out of the Pmod's 4. See
+ * the block comment on it further down; it is the only part of this file that is not
+ * obvious on sight.
+ *
  * COMMITTED TO SILICON HERE (worth reviewing before tape-out): the zone geometry and the
  * per-group hue. Which frequency feeds which band, how loud counts as full, attack/decay
  * and beat sensitivity are all firmware and remain changeable after tape-out.
@@ -67,6 +72,7 @@ module pixel_gen #(
     input  wire [FRAME_W-1:0]  frame,       // increments once per frame: the animation clock
     input  wire [BAND_W-1:0]   cfg,         // {dim[1:0], palette[1:0], bw}, 0 = classic
     input  wire [BAND_W-1:0]   cfg2,        // breathing amplitude, in 2-pixel units
+    input  wire [BAND_W-1:0]   cfg3,        // {--, fade_sh[1:0], fade_en}, 0 = hard tips
 
     // ---- STAGE 2 (one clock later) ----
     output wire [1:0]          r,
@@ -96,6 +102,12 @@ module pixel_gen #(
   // rather than let a changed FRAME_W silently reshape the animation.
   initial if (FRAME_W != 8)
     $error("pixel_gen: the breathing triangle assumes FRAME_W == 8 (got %0d)", FRAME_W);
+
+  // The fade's widest setting slices tip_dist[7:3], so px must be at least 8 bits wide.
+  // At the committed 800x600 PXW is 11; guard it rather than let a narrower override
+  // silently select out-of-range bits.
+  initial if (PXW < 8)
+    $error("pixel_gen: the fade shifter needs PXW >= 8 (got %0d)", PXW);
 
   // ---- geometry (REBALANCED 2026-08-27: more screen for bass, less for highs) ----
   localparam BOTTOM_TOP   = 360;                  // bass strip: py >= 360, so 240 px deep
@@ -155,11 +167,32 @@ module pixel_gen #(
   //      multiplier and the hue. ----
   wire [1:0] grp = in_bottom ? 2'd0 : in_left ? 2'd1 : in_right ? 2'd2 : 2'd3;
 
+  // ---- ordered-dither threshold for THIS pixel (see the fade section in stage 2) ----
+  // The 4x4 Bayer matrix
+  //        0  8  2 10
+  //       12  4 14  6
+  //        3 11  1  9
+  //       15  7 13  5
+  // is NOT a stored table here. The Bayer construction (interleave the bits of y^x with
+  // those of y, then bit-reverse) collapses for the 4x4 case to {v0, y0, v1, y1} with
+  // v = px ^ py -- TWO XOR GATES AND WIRES, where a 16-entry 4-bit LUT would have been a
+  // real mux. That identity is what makes this effect affordable at all, and
+  // model/test_visual_ref.py's test_bayer_is_the_canonical_matrix pins it to the standard
+  // matrix so it cannot quietly become "noise with a nice comment".
+  //
+  // Computed in stage 1 and carried across the register so it stays paired with the pixel
+  // whose depth it will dither. Using stage 2's px/py instead would shift the pattern by
+  // one pixel -- invisible on a monitor, but it would break the bit-exact model comparison,
+  // and a check that has been weakened is worse than no check.
+  wire [1:0] dith_v = px[1:0] ^ py[1:0];
+  wire [3:0] bayer  = {dith_v[0], py[0], dith_v[1], py[1]};
+
   // ======================= PIPELINE REGISTER (stage 1 -> stage 2) =======================
   reg [BAND_W-1:0] band_q;
   reg [PXW-1:0]    depth_q;
   reg [1:0]        grp_q;
   reg              active_q;
+  reg [3:0]        bayer_q;
 
   always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
@@ -167,11 +200,13 @@ module pixel_gen #(
       depth_q <= {PXW{1'b0}};
       grp_q <= 2'd0;
       active_q <= 1'b0;
+      bayer_q <= 4'd0;
     end else begin
       band_q <= band;              // visual_state's mux output, same cycle as `zone`
       depth_q <= depth;
       grp_q <= grp;
       active_q <= active;          // the blanking gate travels with its pixel
+      bayer_q <= bayer;            // the dither threshold travels with its pixel too
     end
   end
   // ======================================================================================
@@ -231,6 +266,67 @@ module pixel_gen #(
   wire [1:0] top = band_q[BAND_W-1:BAND_W-2];
   wire [1:0] lvl = (top == 2'b00) ? 2'b01 : top;
 
+  // ======================= SOFT FADE + ORDERED DITHER (config word 19) ==================
+  // THE PROBLEM. The Tiny VGA Pmod carries 2 bits per channel, so a bar has exactly three
+  // brightnesses and its tip is a hard step from `lvl` to black. Simply fading the last
+  // stretch of the bar does not help: with three levels to play with, a fade is just the
+  // same step moved somewhere else, plus two visible contour lines.
+  //
+  // THE FIX. Carry four extra FRACTIONAL bits of brightness and resolve them SPATIALLY:
+  // light a pixel one level brighter when its fraction beats that pixel's Bayer threshold.
+  // Averaged over a 4x4 cell that is ~16 apparent levels out of the 4 the pins can express,
+  // so the tip reads as a gradient instead of a cliff. Nothing is stored -- the dither is a
+  // function of (px, py), exactly like every other effect here (CLAUDE.md sec.8).
+  //
+  // AND WHY IT IS CHEAP. `tip_dist` reuses the subtraction the `lit` comparison already
+  // needs; the normalisation is a wire slice because the ramp widths are powers of two; the
+  // multiply is by 1, 2 or 3, which is a shift and an add; and the Bayer threshold is two
+  // XORs (above). No divider, no LUT, no multiplier.
+  wire       fade_en = cfg3[0];
+  wire [1:0] fade_sh = cfg3[2:1];        // ramp width = 16 << fade_sh px: 16/32/64/128
+
+  // how far INSIDE the bar this pixel sits: 1 at the very tip, growing toward the base.
+  // Meaningless when the pixel is unlit (it wraps), which is harmless -- `lit` gates the
+  // whole result to black there.
+  wire [PXW-1:0] tip_dist = fill - depth_q;
+
+  // f = min(tip_dist >> fade_sh, 16), i.e. a linear ramp that flattens at the ramp width.
+  // Selecting a 5-bit SLICE plus a "did anything above it survive" flag is the whole
+  // barrel shifter: 16 is representable only via `fade_sat`, so `fade_slice` is 0..15 by
+  // construction whenever the flag is low.
+  //
+  // The 24 px ramp used in the preview is deliberately NOT offered: normalising by 24
+  // needs a divide, and there is no divider on this chip. 24 sits between the 16 and 32
+  // settings, and firmware picks whichever reads better on the actual monitor.
+  reg  [4:0] fade_slice;
+  reg        fade_sat;
+  always @(*) begin
+    case (fade_sh)
+      2'd0:    begin fade_slice = tip_dist[4:0]; fade_sat = |tip_dist[PXW-1:4]; end
+      2'd1:    begin fade_slice = tip_dist[5:1]; fade_sat = |tip_dist[PXW-1:5]; end
+      2'd2:    begin fade_slice = tip_dist[6:2]; fade_sat = |tip_dist[PXW-1:6]; end
+      default: begin fade_slice = tip_dist[7:3]; fade_sat = |tip_dist[PXW-1:7]; end
+    endcase
+  end
+  wire [4:0] fade_f = fade_sat ? 5'd16 : fade_slice;         // 0..16
+
+  // lvl * f with lvl in {1,2,3}: f + 2f, each gated. Max 3*16 = 48, so 6 bits is exact.
+  wire [5:0] fade_scaled = (lvl[0] ? {1'b0, fade_f} : 6'd0) +
+                           (lvl[1] ? {fade_f, 1'b0} : 6'd0);
+
+  // Split into whole levels and a 4-bit fraction, then let the dither decide the last step.
+  // NO SATURATION IS NEEDED: fade_scaled[5:4] can only be 3 at fade_scaled == 48, where the
+  // fraction is 0 and the bump cannot fire. model/test_visual_ref.py proves that
+  // exhaustively (test_fade_level_arithmetic_cannot_exceed_three) rather than asserting it.
+  wire [1:0] fade_lvl = fade_scaled[5:4] + {1'b0, (fade_scaled[3:0] > bayer_q)};
+
+  // A faded pixel CAN come out at level 0. That is the effect, and it is the one place the
+  // "a lit pixel is never level 0" rule above is deliberately relaxed -- but only when
+  // firmware asks for it. cfg3 == 0 restores the hard tip exactly, which is the all-zero
+  // rule an unwritten MCU config region depends on.
+  wire [1:0] lvl_o = fade_en ? fade_lvl : lvl;
+  // =====================================================================================
+
   // ---- config: firmware-selectable look, fetched with visual_state each vblank ----
   // ALL-ZERO means "behave exactly as before" -- classic palette, colour, full brightness.
   // An unwritten MCU config region reads back 0, so firmware that only publishes bands
@@ -265,9 +361,9 @@ module pixel_gen #(
   wire hue_g = hue[1];
   wire hue_b = hue[0];
 
-  wire [1:0] zr = (lit && hue_r) ? lvl : 2'b00;
-  wire [1:0] zg = (lit && hue_g) ? lvl : 2'b00;
-  wire [1:0] zb = (lit && hue_b) ? lvl : 2'b00;
+  wire [1:0] zr = (lit && hue_r) ? lvl_o : 2'b00;
+  wire [1:0] zg = (lit && hue_g) ? lvl_o : 2'b00;
+  wire [1:0] zb = (lit && hue_b) ? lvl_o : 2'b00;
 
   // ---- kick flash: a global white lift on every pixel, saturating (never wrapping --
   //      a wrapped flash would read as a black frame on the beat, the worst possible
@@ -286,6 +382,11 @@ module pixel_gen #(
   // with a 128-step triangle is what sets the ~4.3 s period.
   // (amp_raw[6] is NOT sunk -- the 7-bit comparison in amp_cap reads it.)
   wire _unused_anim = &{1'b0, frame[0]};
+
+  // cfg3[4:3] are reserved for the next fade-family knob. Sink them explicitly rather than
+  // narrowing the port: the bus fetches a full BAND_W word either way, so a narrower port
+  // would only move the same waiver somewhere less obvious.
+  wire _unused_cfg3 = &{1'b0, cfg3[BAND_W-1:3]};
 
   wire [2:0] rsum = {1'b0, zr} + {1'b0, fl};
   wire [2:0] gsum = {1'b0, zg} + {1'b0, fl};
