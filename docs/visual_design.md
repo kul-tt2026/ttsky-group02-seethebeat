@@ -36,11 +36,12 @@ follows from that.
 | `flash` | 1 | 5 bits (0–31) | `16` | global kick-flash level |
 | `cfg` | 1 | 5 bits | `17` | look config: `{dim[1:0], palette[1:0], bw}` |
 | `cfg2` | 1 | 5 bits | `18` | breathing amplitude, in 2-px units (0 = off) |
+| `cfg3` | 1 | 5 bits | `19` | fade config: `{--, fade_sh[1:0], fade_en}` (0 = hard tips) |
 
 The chip also keeps an 8-bit **`frame` counter** (not part of `visual_state` — it is
 generated on chip from `frame_start`), which drives the breathing edge in §4.
 
-**95 flip-flops total** (16×5 bands + 5 flash + 2×5 config), plus a 16:1 read mux. This is the largest single area item in the
+**100 flip-flops total** (16×5 bands + 5 flash + 3×5 config), plus a 16:1 read mux. This is the largest single area item in the
 visual back-end and the main knob if utilisation gets tight — cost scales directly as
 `NBANDS × BAND_W`.
 
@@ -189,6 +190,61 @@ The pin *names* are the trap — the pin labelled `R1` carries `r[1]`, the MSB. 
 
 ---
 
+## 4b. Soft fade + ordered dither — the trick that beats the 2-bit Pmod
+
+**Built 2026-08-28. Off by default (`cfg3 == 0`), so it changes nothing until firmware asks.**
+
+### The problem it solves
+
+The Tiny VGA Pmod carries **2 bits per channel**. That is four levels, one of which is black,
+so a bar has exactly **three** brightnesses and its tip is a hard step to black. Simply
+fading the last stretch of the bar does not help — with three levels to spend, a fade is the
+same step moved somewhere else, plus two visible contour lines.
+
+### What it does instead
+
+Carry **four extra fractional bits** of brightness and resolve them **spatially**: light a
+pixel one level brighter when its fraction beats that pixel's threshold in a 4×4 Bayer
+matrix. Averaged over a 4×4 cell that is **~16 apparent levels out of the 4 the pins can
+express**, so the tip reads as a gradient instead of a cliff.
+
+```
+  tip_dist = fill - depth              how far inside the bar this pixel is
+  f        = min(tip_dist >> fade_sh, 16)      the ramp, 0..16
+  scaled   = lvl * f                   lvl is 1..3, so this is a shift and an add
+  level    = scaled>>4  +  (scaled[3:0] > bayer4(px, py))
+```
+
+Nothing is stored. The dither is a function of `(px, py)` like every other effect here, which
+is what makes it legal in a racing-the-beam renderer with no frame buffer.
+
+### Why it is cheap — the four things that could each have been expensive
+
+| Would normally need | What we do instead |
+| --- | --- |
+| A 16-entry × 4-bit LUT for the Bayer matrix | The Bayer construction has a **closed form**: for 4×4 it collapses to `{v0, y0, v1, y1}` with `v = px ^ py`. **Two XOR gates and wires.** |
+| A divide, to normalise the ramp | Ramp widths are **powers of two only**, so normalisation is `tip_dist >> fade_sh` — a wire slice plus a 4:1 mux |
+| A multiplier for `lvl × f` | `lvl` is 1, 2 or 3, so it is `f + 2f` with each term gated — one 6-bit adder |
+| A subtractor for `tip_dist` | Shares the one the `lit` comparison already needs |
+
+The preview used a **24 px** ramp, which reads well but needs a divide to normalise — there
+is no divider on this chip and no room for one. 24 sits between the 16 and 32 settings;
+firmware picks whichever looks right on the actual monitor.
+
+### The one behavioural change worth knowing
+
+A lit pixel **can** come out at level 0 near the tip. That is the effect, and it is the one
+place the "a lit pixel is never level 0" rule of §4 is deliberately relaxed — but only when
+firmware turns it on. It does mean a **very quiet band**, whose whole bar is shorter than the
+ramp, gets dimmer than it used to. Firmware's answer is a narrower `fade_sh`, or the fade off.
+
+Everything else holds unchanged, and is tested rather than asserted: **silence stays perfectly
+black**, blanking stays black, and the fade can only ever *subtract* brightness — it never
+brightens a pixel and never overflows the 2-bit channel (a wrapped tip would read as a black
+notch, the most visible artefact available).
+
+---
+
 ## 5. Refresh timing
 
 `vga_timing` emits `frame_start`, a one-clock pulse at the beginning of vertical blanking.
@@ -206,7 +262,7 @@ returned value into `visual_state`.
 
 ---
 
-## 5b. The look config — three firmware knobs
+## 5b. The look config — five firmware knobs
 
 Config word 17 selects how the chip renders, and **every field is designed so that zero
 means "as before"**:
@@ -219,6 +275,16 @@ means "as before"**:
 
 And config word **18** is a fourth knob: **breathing amplitude**, 0–31 in 2-pixel units
 (0 = off, 31 = 62 px).
+
+Config word **19** is the fifth: the **soft fade + ordered dither** on each bar's tip.
+
+| Bits | Field | Values |
+| --- | --- | --- |
+| `[0]` | **fade_en** | 0 = hard bar tip (exactly as before), 1 = soften it |
+| `[2:1]` | **fade_sh** | ramp width `16 << fade_sh` px: 16 / 32 / 64 / 128 |
+| `[4:3]` | reserved | must be written 0 |
+
+See §4b for what it does and why it is cheap.
 
 **Why dim and not cap:** an unwritten MCU config region reads back 0. Encoding brightness as
 a *cap* would make 0 mean "black screen", so any firmware that forgot the config would ship a
@@ -286,6 +352,9 @@ word is full.
 
 ---
 
+
+**Added 2026-08-28:** the fade (word 19) joins this list. It is a good knob candidate -- the right softness depends on the room, the projector and how far away the audience is, which is exactly the kind of thing nobody gets right on paper.
+
 ## 6. Frozen vs firmware — read this before tape-out
 
 ### Frozen in silicon (cannot change after tape-out)
@@ -293,6 +362,8 @@ word is full.
 - Zone **geometry**: which pixels belong to each zone, cell sizes, fill directions, `MUL`.
 - Zone **hue** — the bottom strip is red, permanently.
 - The brightness curve (top 2 bits, floored at 1) and flash saturation.
+- The fade's **shape** (a linear ramp), its **dither pattern** (4x4 Bayer) and the four ramp
+  widths it can be set to. **Whether it is on, and which width, are firmware** (word 19).
 - The breathing effect's triangle shape, its ~4.3 s period, and its 62 px hardware
   ceiling. **The amplitude itself is firmware-controlled** (config word 18).
 - `visual_state`'s **shape**: 16 bands × 5 bits + 5-bit flash, and its CFG address map.
@@ -310,6 +381,9 @@ word is full.
 - Attack/decay envelopes — a bar that snaps up and falls back slowly costs **zero silicon**.
 - Beat threshold and sensitivity; sample rate, decimation, windowing, gain and what counts
   as "full scale".
+- **Bar-tip softness**: fade on/off and the ramp width, config word 19. Note this one
+  interacts with the band values -- a very quiet band is shorter than a wide ramp and so is
+  dimmed by it, which firmware compensates with a narrower width or more gain.
 
 ### 🔴 The dependency that makes all of the above real
 
@@ -329,10 +403,17 @@ Costed and discussed in `PART2_VISUALS_VGA_PLAN.md` § *Firmware-tunable visuals
 | Brightness cap | ~15 GE | dim the whole scene |
 | Palette select | ~80 GE | 4 hue sets |
 | **Per-zone hue in `visual_state`** | **~290 GE** | full firmware colour control |
-| **Soft fade to black + 4×4 ordered dither** | **~180 GE** | ~16 apparent levels per channel instead of 4; kills the blocky edges |
+| ~~Soft fade + 4×4 ordered dither~~ | ~~~180 GE~~ | **BUILT 2026-08-28** — see §4b |
 
-The last two compete for the same gates: per-zone hue is *insurance* (a wrong colour becomes
-a firmware edit), fade+dither is *aesthetics*. Decide against the post-harden number.
+**Do not read the old ~180 GE as the delivered cost.** The two expensive pieces were
+avoided — the Bayer matrix has a closed form (two XORs, not a 16-entry LUT) and the ramp
+widths are powers of two (a wire slice, not a divider) — but the build also added a fifth
+config word (5 DFFs + decode) and 4 pipeline flops that the estimate never counted. A hand
+count lands somewhere around **200–250 GE**, and hand counts of this design have been
+**30% apart** before. **The harden report is the number.**
+
+**Per-zone hue is now the only remaining item on the list.** Decide it against the
+utilisation taken *with* the fade in place, not the old 70%.
 
 Note the "more than 4 colours" question: the Pmod ceiling is 64 colours, and the limit is 4
 *levels per channel*, not 4 colours. The headroom is already there — the current design
