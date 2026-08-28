@@ -123,10 +123,18 @@ async def test_reserved_addresses_are_inert(dut):
     before = await _dump(dut)
     flash_before = int(dut.flash.value)
     max_addr = (1 << len(dut.wr_addr.value)) - 1
+    defined = {V.VisualState.ADDR_CFG, V.VisualState.ADDR_CFG2, V.VisualState.ADDR_CFG3}
     for addr in range(V.VisualState.ADDR_FLASH + 1, max_addr + 1):
+        if addr in defined:
+            continue                      # those have their own tests; they are not reserved
         await _write(dut, addr, V.BAND_MAX)
     assert await _dump(dut) == before, "a reserved-address write aliased onto a band"
     assert int(dut.flash.value) == flash_before, "a reserved write hit flash"
+    # ...and it must not have landed in a config register either. Each new config word
+    # widens the decoder, so this is where an off-by-one in the address chain shows up.
+    for name in ("cfg", "cfg2", "cfg3"):
+        assert int(getattr(dut, name).value) == 0, (
+            "a reserved-address write landed in {}".format(name))
 
 
 @cocotb.test()
@@ -141,3 +149,69 @@ async def test_writes_need_wr_en(dut):
     await ClockCycles(dut.clk, 4)
     await Timer(1, unit="ns")
     assert await _dump(dut) == before, "state changed with wr_en low"
+
+
+@cocotb.test()
+async def test_config_register(dut):
+    """CFG address 17 holds the look config. It must reset to ZERO (= classic look), accept
+    writes, and not be disturbed by band or flash traffic."""
+    cocotb.start_soon(Clock(dut.clk, 25, unit="ns").start())
+    await _reset(dut)
+
+    assert int(dut.cfg.value) == 0, "cfg must reset to 0 (= behave as before)"
+
+    bands_before = await _dump(dut)
+    for val in (0b00001, 0b10110, V.BAND_MAX, 0):
+        await _write(dut, V.VisualState.ADDR_CFG, val)
+        assert int(dut.cfg.value) == val, "cfg={} expected {}".format(
+            int(dut.cfg.value), val)
+    assert await _dump(dut) == bands_before, "writing cfg disturbed the bands"
+
+    # a band write must not disturb cfg
+    await _write(dut, V.VisualState.ADDR_CFG, 0b10101)
+    await _write(dut, 3, 7)
+    assert int(dut.cfg.value) == 0b10101, "a band write clobbered cfg"
+    assert int(dut.flash.value) == 0, "a band write clobbered flash"
+
+
+@cocotb.test()
+async def test_second_config_register(dut):
+    """CFG address 18 holds the breathing amplitude. Reset to 0 (= breathing off), writable,
+    and isolated from the bands, flash and the first config word."""
+    cocotb.start_soon(Clock(dut.clk, 25, unit="ns").start())
+    await _reset(dut)
+
+    assert int(dut.cfg2.value) == 0, "breathing must default to off"
+    bands_before = await _dump(dut)
+
+    await _write(dut, V.VisualState.ADDR_CFG, 0b10101)
+    for val in (1, 8, V.BAND_MAX, 0):
+        await _write(dut, V.VisualState.ADDR_CFG2, val)
+        assert int(dut.cfg2.value) == val, "cfg2={} expected {}".format(
+            int(dut.cfg2.value), val)
+        assert int(dut.cfg.value) == 0b10101, "cfg2 write clobbered cfg"
+    assert await _dump(dut) == bands_before, "cfg2 writes disturbed the bands"
+    assert int(dut.flash.value) == 0, "cfg2 writes disturbed flash"
+
+
+@cocotb.test()
+async def test_third_config_register(dut):
+    """CFG address 19 holds the fade/dither config. Reset to 0 (= hard bar tips, the
+    pre-fade look), writable, and isolated from the bands, flash and the other two config
+    words -- the same isolation check that has caught every decoder off-by-one so far."""
+    cocotb.start_soon(Clock(dut.clk, 25, unit="ns").start())
+    await _reset(dut)
+
+    assert int(dut.cfg3.value) == 0, "the fade must default to off"
+    bands_before = await _dump(dut)
+
+    await _write(dut, V.VisualState.ADDR_CFG, 0b01011)
+    await _write(dut, V.VisualState.ADDR_CFG2, 0b00110)
+    for val in (1, 0b111, V.BAND_MAX, 0):
+        await _write(dut, V.VisualState.ADDR_CFG3, val)
+        assert int(dut.cfg3.value) == val, "cfg3={} expected {}".format(
+            int(dut.cfg3.value), val)
+        assert int(dut.cfg.value) == 0b01011, "cfg3 write clobbered cfg"
+        assert int(dut.cfg2.value) == 0b00110, "cfg3 write clobbered cfg2"
+    assert await _dump(dut) == bands_before, "cfg3 writes disturbed the bands"
+    assert int(dut.flash.value) == 0, "cfg3 writes disturbed flash"

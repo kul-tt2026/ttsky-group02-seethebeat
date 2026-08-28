@@ -38,6 +38,7 @@ jobs:
           python model/test_vga_ref.py
           python model/test_visual_ref.py
           python model/test_geometry_sync.py
+          python model/test_rtl_keywords.py
 
   rtl-unit-tests:
     runs-on: ubuntu-24.04

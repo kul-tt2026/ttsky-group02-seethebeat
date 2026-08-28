@@ -13,8 +13,8 @@
  *      and pulses done. The transform is left where the MCU wants it -- in its own memory --
  *      and firmware takes it from there: magnitude, log, band summing, beat detection and
  *      the zone colour map all run on the MCU, where they cost no silicon.
- *   2. Once per frame, at the start of vblank, the chip fetches the 17-word `visual_state`
- *      block (16 bands + flash) back from the MCU's config region and latches it. Updating
+ *   2. Once per frame, at the start of vblank, the chip fetches the 20-word `visual_state`
+ *      block (16 bands + flash + 3 config) back from the MCU's config region and latches it. Updating
  *      only during blanking is what stops a bar changing height halfway down the screen.
  *
  * Both loops are driven by fft_ctrl, which is the chip's single bus master -- see the note
@@ -51,7 +51,17 @@ module tt_um_group02_seethebeat (
   wire        active, hsync, vsync, vblank, frame_start;
   wire [1:0]  vga_r, vga_g, vga_b;
   wire [3:0]  zone;
-  wire [4:0]  band, flash;
+  wire [4:0]  band, flash, cfg, cfg2, cfg3;
+
+  // ---- the animation clock ----
+  // 800x600 pixels cannot be stored, so nothing animates by being remembered. The only
+  // clock a stateless renderer has is this counter, and every effect must be a function of
+  // (position, time, energy). It wraps every 256 frames (~4.3 s at 60 Hz).
+  reg [7:0] frame;
+  always @(posedge clk or negedge rst_n) begin
+    if (!rst_n)          frame <= 8'd0;
+    else if (frame_start) frame <= frame + 8'd1;
+  end
 
   vga_timing u_vga (
       .clk(clk), .rst_n(rst_n),
@@ -63,19 +73,22 @@ module tt_um_group02_seethebeat (
   // The only visual state on the chip. Its power-on defaults draw a readable picture
   // before any firmware exists, so the output path can be validated on a monitor with
   // nothing else connected. Refreshed once per frame, in vblank: `frame_start` asks the bus master to fetch the
-  // 17 words (16 bands + flash) from the MCU's config region. Updating only during
+  // 20 words (16 bands + flash + 3 config) from the MCU's config region. Updating only
   // blanking is what keeps a bar from changing height halfway down the screen.
   visual_state u_vs (
       .clk(clk), .rst_n(rst_n),
       .wr_en(vs_wr_en), .wr_addr(vs_wr_addr), .wr_data(vs_wr_data),
-      .rd_zone(zone), .band(band), .flash(flash)
+      .rd_zone(zone), .band(band), .flash(flash),
+      .cfg(cfg), .cfg2(cfg2), .cfg3(cfg3)
   );
 
   // Combinational chain, no loop: pixel_gen decodes (px,py) -> zone, visual_state muxes
   // zone -> band, pixel_gen turns band -> colour. All inside one pixel clock.
   pixel_gen u_pix (
+      .clk(clk), .rst_n(rst_n),
       .px(px), .py(py), .active(active),
-      .zone(zone), .band(band), .flash(flash),
+      .zone(zone), .band(band), .flash(flash), .frame(frame),
+      .cfg(cfg), .cfg2(cfg2), .cfg3(cfg3),
       .r(vga_r), .g(vga_g), .b(vga_b)
   );
 
@@ -99,10 +112,27 @@ module tt_um_group02_seethebeat (
   assign uio_out = fft_uio_out;
   assign uio_oe  = fft_uio_oe;
 
+  // ---- sync is delayed by the SAME one clock as the pixel pipeline ----
+  // pixel_gen registers band/depth/group, so a pixel's colour emerges one clock after its
+  // coordinates. Delaying hsync/vsync by one clock too keeps them aligned with it: the
+  // monitor sees an identical waveform shifted by 25 ns, so nothing on screen moves. Get
+  // this wrong -- delay the colour but not the sync -- and the blanking gate slides
+  // relative to the picture, which is the classic way to break a VGA output.
+  reg hsync_q, vsync_q;
+  always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      hsync_q <= 1'b0;
+      vsync_q <= 1'b0;
+    end else begin
+      hsync_q <= hsync;
+      vsync_q <= vsync;
+    end
+  end
+
   // Tiny VGA Pmod packing: uo_out = {hsync, B0, G0, R0, vsync, B1, G1, R1}.
   // The pin NAMES are the trap -- the pin labelled R1 carries r[1], the MSB.
-  assign uo_out = {hsync, vga_b[0], vga_g[0], vga_r[0],
-                   vsync, vga_b[1], vga_g[1], vga_r[1]};
+  assign uo_out = {hsync_q, vga_b[0], vga_g[0], vga_r[0],
+                   vsync_q, vga_b[1], vga_g[1], vga_r[1]};
 
   // `vblank` is available for a future effect; `fft_done`/`busy` are observable on the bus
   // (the MCU knows when it last asserted frame-ready). Sink them for lint.

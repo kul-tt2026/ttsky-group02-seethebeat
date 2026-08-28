@@ -18,10 +18,10 @@ endef
 #     /* verilator lint_off WIDTHTRUNC */  <one deliberate line>  /* verilator lint_on WIDTHTRUNC */
 # Global waivers (kept minimal):
 #   DECLFILENAME           - TT puts the tt_um_* module in project.v (name != file).
-#   MULTITOP  (temporary)  - during development each block (cordic, butterfly, ...) is
-#                            its own top; they unify under tt_um_* at integration.
-#     TODO(integration): once project.v instantiates the whole design (single top),
-#     REMOVE -Wno-MULTITOP so lint again flags any orphaned/forgotten module.
+#   (MULTITOP was waived during development, when each block was its own top. REMOVED
+#    2026-08-27: project.v now instantiates the whole design, so tt_um_group02_seethebeat
+#    is the only top and lint once again flags any orphaned or forgotten module. This is
+#    what src/attic/ being outside LINT_SOURCES was for -- see the note below.)
 # ---------------------------------------------------------------------------
 #
 # src/attic/ is DELIBERATELY excluded from LINT_SOURCES (the `src/*.v` wildcard does not
@@ -31,7 +31,7 @@ endef
 # deliberately-orphaned module tripping it.
 LINT_SOURCES ?= $(wildcard src/*.v)
 ATTIC_SOURCES ?= $(wildcard src/attic/*.v)
-LINT_FLAGS   ?= -Wall -Wno-DECLFILENAME -Wno-MULTITOP
+LINT_FLAGS   ?= -Wall -Wno-DECLFILENAME
 
 lint: lint-attic
 	@command -v verilator >/dev/null 2>&1 || { \

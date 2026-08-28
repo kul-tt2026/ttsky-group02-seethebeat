@@ -69,6 +69,7 @@ def _parse_consts(path):
 
 PIXEL_GEN = _parse_consts(os.path.join(SRC, "pixel_gen.v"))
 VISUAL_STATE = _parse_consts(os.path.join(SRC, "visual_state.v"))
+FFT_CTRL = _parse_consts(os.path.join(SRC, "fft_ctrl.v"))
 
 
 def _cmp(rtl, name, expected, where):
@@ -97,6 +98,19 @@ def test_zone_splits_match():
     _cmp(PIXEL_GEN, "CENTRE_SPLIT", V.CENTRE_SPLIT, "pixel_gen.v")
 
 
+def test_animation_constants_match():
+    """The breathing effect's constants live in both places too, so guard them the same way
+    -- a FRAME_W mismatch would change the breathing period without any test noticing."""
+    _cmp(PIXEL_GEN, "FRAME_W", V.FRAME_W, "pixel_gen.v")
+    # WOBBLE_MAX is deliberately NOT an RTL parameter -- the ceiling is implied by the
+    # config field width. Check the model derives it that way, so the two stay coherent.
+    assert V.WOBBLE_MAX == ((1 << V.BAND_W) - 1) * V.WOBBLE_STEP, (
+        "model WOBBLE_MAX {} is not what a {}-bit cfg2 in {}-px units can reach".format(
+            V.WOBBLE_MAX, V.BAND_W, V.WOBBLE_STEP))
+    assert "WOBBLE_MAX" not in PIXEL_GEN, (
+        "pixel_gen.v has a WOBBLE_MAX parameter again -- it can only be dead logic")
+
+
 def test_visual_state_shape_matches():
     _cmp(PIXEL_GEN, "NBANDS", V.NBANDS, "pixel_gen.v")
     _cmp(PIXEL_GEN, "BAND_W", V.BAND_W, "pixel_gen.v")
@@ -104,6 +118,28 @@ def test_visual_state_shape_matches():
     _cmp(VISUAL_STATE, "NBANDS", V.NBANDS, "visual_state.v")
     _cmp(VISUAL_STATE, "BAND_W", V.BAND_W, "visual_state.v")
     _cmp(VISUAL_STATE, "FLASH_W", V.FLASH_W, "visual_state.v")
+
+
+def test_refresh_fetches_every_config_word():
+    """fft_ctrl.v's VS_N is how many words the vblank refresh fetches. It must cover every
+    address the model defines -- 16 bands + flash + both config words. When cfg2 was added
+    and VS_N went 18 -> 19, a cocotb test still hardcoding 17 words went stale and failed in
+    a way that looked like an RTL bug; this catches that drift directly."""
+    want = V.CFG3_ADDR + 1
+    _cmp(FFT_CTRL, "VS_N", want, "fft_ctrl.v")
+    # VS_W is how many bits of each fetched word reach visual_state, so it must track
+    # BAND_W. The documented area-reduction ladder lists "fewer bits per band 8 -> 4" as a
+    # lever, which would change BAND_W and silently truncate every value if VS_W lagged.
+    _cmp(FFT_CTRL, "VS_W", V.BAND_W, "fft_ctrl.v")
+    assert V.VisualState.ADDR_CFG2 == V.CFG2_ADDR
+    assert V.VisualState.ADDR_CFG3 == V.CFG3_ADDR
+    assert V.CFG2_ADDR == V.CFG_ADDR + 1 == V.NBANDS + 2, "config address map is not contiguous"
+    assert V.CFG3_ADDR == V.CFG2_ADDR + 1, "config address map is not contiguous"
+    # The register file must actually decode every address the refresh fetches, or the last
+    # word is streamed into nothing and the feature is silently dead in silicon.
+    for name, addr in (("ADDR_CFG", V.CFG_ADDR), ("ADDR_CFG2", V.CFG2_ADDR),
+                       ("ADDR_CFG3", V.CFG3_ADDR)):
+        _cmp(VISUAL_STATE, name, addr, "visual_state.v")
 
 
 def test_every_zone_can_actually_fill():
@@ -121,6 +157,13 @@ def test_every_zone_can_actually_fill():
             "{}: reach {} wastes range over a depth of {}".format(what, reach, depth)
 
 
+def test_wobble_step_is_what_the_rtl_hardcodes():
+    """pixel_gen.v builds the amplitude as {cfg2, 1'b0}, i.e. a hardcoded x2. If the model
+    ever wants a different step the concatenation must change too, so pin it here -- the
+    same pattern as the fill multipliers below."""
+    assert V.WOBBLE_STEP == 2,         "model WOBBLE_STEP is {} but pixel_gen.v hardcodes x2".format(V.WOBBLE_STEP)
+
+
 def test_fill_multipliers_are_what_the_rtl_hardcodes():
     """pixel_gen.v builds the fill as base = band<<2, then base / base<<1 / base<<1+base.
     That hardcodes x4 / x8 / x12 -- if the model ever wants different multipliers, the RTL
@@ -133,7 +176,10 @@ def test_fill_multipliers_are_what_the_rtl_hardcodes():
 def _main():
     checks = [test_screen_size_matches, test_region_boundaries_match,
               test_zone_splits_match, test_visual_state_shape_matches,
+              test_animation_constants_match,
+              test_refresh_fetches_every_config_word,
               test_every_zone_can_actually_fill,
+              test_wobble_step_is_what_the_rtl_hardcodes,
               test_fill_multipliers_are_what_the_rtl_hardcodes]
     print("SeeTheBeat RTL-vs-model geometry sync check")
     print("-" * 58)

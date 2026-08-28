@@ -7,7 +7,8 @@ Keep this file current. When `src/pixel_gen.v`, `src/visual_state.v` or
 `model/visual_ref.py` change, change this too — they are the implementation of what is
 written here, and `model/test_visual_ref.py` is what proves they agree.
 
-*Last updated: 2026-08-27 (geometry rebalance + visual_state refresh path).*
+*Last updated: 2026-08-28 (geometry rebalance, refresh path, breathing edge, look config,
+pixel pipeline).*
 
 ---
 
@@ -33,8 +34,14 @@ follows from that.
 | --- | --- | --- | --- | --- |
 | `band[0..15]` | 16 | 5 bits (0–31) | `0`–`15` | energy in that frequency band |
 | `flash` | 1 | 5 bits (0–31) | `16` | global kick-flash level |
+| `cfg` | 1 | 5 bits | `17` | look config: `{dim[1:0], palette[1:0], bw}` |
+| `cfg2` | 1 | 5 bits | `18` | breathing amplitude, in 2-px units (0 = off) |
+| `cfg3` | 1 | 5 bits | `19` | fade config: `{--, fade_sh[1:0], fade_en}` (0 = hard tips) |
 
-**85 flip-flops total**, plus a 16:1 read mux. This is the largest single area item in the
+The chip also keeps an 8-bit **`frame` counter** (not part of `visual_state` — it is
+generated on chip from `frame_start`), which drives the breathing edge in §4.
+
+**100 flip-flops total** (16×5 bands + 5 flash + 3×5 config), plus a 16:1 read mux. This is the largest single area item in the
 visual back-end and the main knob if utilisation gets tight — cost scales directly as
 `NBANDS × BAND_W`.
 
@@ -120,8 +127,62 @@ For each pixel, in one clock:
 6. **Kick flash** — the top 2 bits of `flash` are added to all three channels and
    **saturated**, never wrapped. A wrapped flash would read as a black frame exactly on the
    beat, the worst possible artefact.
-7. **Blanking gate** — outside the visible area the output is forced to black. Light in the
+7. **Breathing edge (animation).** The fill threshold gains a small time-varying offset
+   so a bar's tip drifts in and out instead of sitting still between beats:
+
+   - `frame` is an 8-bit counter incremented once per `frame_start`; it wraps every 256
+     frames (~4.3 s at 60 Hz). It is the **only** clock a stateless renderer has — nothing
+     can animate by being remembered, because nothing can be stored.
+   - `wobble = triangle(frame)`, **clipped to the firmware-set amplitude** (config word 18,
+     in 2-px units → 0–62 px), one full breath per wrap.
+   - **The amplitude is a knob, not a constant.** The first version fixed it at 7 px — and
+     at 7 px the entire breathing range was *smaller than one band step* in the bass (8 px)
+     and centre (12 px), i.e. 82% of the screen, so the effect sat below the quantisation of
+     the thing it modulates and was simply invisible. The general lesson: **an effect that
+     modulates a quantised quantity must span several of its steps to be seen at all.**
+     Rather than guess a new constant, the amplitude moved into config — a value you cannot
+     retune after tape-out is a value you will get wrong.
+   - `cfg2 = 0` means no breathing, which is a legitimate setting and where an unwritten
+     config region leaves the chip.
+   - **A triangle, not a sine, by necessity.** The CORDIC is iterative — 21 clocks per
+     result — while the renderer needs a value *every pixel clock*, so a per-pixel sine is
+     impossible by construction. A triangle off the counter's own bits costs a handful of
+     gates and is indistinguishable once it drives a soft edge.
+   - **A silent band stays perfectly black.** The wobble may only extend a bar that is
+     already lit (`fill = 0 if band == 0`). Without that guard the whole screen would
+     shimmer faintly through quiet passages — the opposite of the mostly-black look.
+   - `wobble(0) == 0`, so a frame-0 render is exactly the un-animated picture. Every static
+     test relies on this.
+
+8. **Blanking gate** — outside the visible area the output is forced to black. Light in the
    porches makes a monitor refuse to lock or shift the image sideways.
+
+### The pixel path is PIPELINED (2026-08-28)
+
+Steps 1–8 above are split across **one register stage**, after the band lookup:
+
+```
+stage 1   (px,py) -> zone decode -> depth, group -> visual_state 16:1 mux -> band
+          ---- register: band[4:0], depth[10:0], group[1:0], active ----
+stage 2   fill (+wobble) -> compare -> palette/hue -> level/cap -> flash+saturate -> pin
+```
+
+**Why:** this chain was the design's critical path in every harden report — the worst
+endpoint was always a colour bit (`uo_out[4]`, then `uo_out[5]`). Adding the config knobs
+pushed its raw slack from +0.043 ns to −0.474 ns in a single batch, and Phase 5's effects
+target the same cone. The split roughly halves it for **21 flops**.
+
+**`hsync`/`vsync` are delayed by the same one clock** in `project.v`, so sync stays aligned
+with colour and the monitor sees an identical waveform shifted by 25 ns — nothing on screen
+moves. Delaying the colour but *not* the sync is the classic way to break a VGA output.
+
+**`flash`, `frame`, `cfg` and `cfg2` are deliberately not pipelined.** They are per-frame
+constants written during vblank, so the one-cycle skew can only touch a pixel inside the
+blanking interval, where the output is forced black anyway. Registering them would cost 23
+more flops to fix something invisible.
+
+**The function is unchanged** — only its timing. That is why `model/visual_ref.py` needs no
+pipeline of its own, and why the RTL-vs-model comparison is still bit-exact.
 
 **Output packing** (Tiny VGA Pmod): `uo_out = {hsync, B0, G0, R0, vsync, B1, G1, R1}`.
 The pin *names* are the trap — the pin labelled `R1` carries `r[1]`, the MSB. Colour is
@@ -129,10 +190,65 @@ The pin *names* are the trap — the pin labelled `R1` carries `r[1]`, the MSB. 
 
 ---
 
+## 4b. Soft fade + ordered dither — the trick that beats the 2-bit Pmod
+
+**Built 2026-08-28. Off by default (`cfg3 == 0`), so it changes nothing until firmware asks.**
+
+### The problem it solves
+
+The Tiny VGA Pmod carries **2 bits per channel**. That is four levels, one of which is black,
+so a bar has exactly **three** brightnesses and its tip is a hard step to black. Simply
+fading the last stretch of the bar does not help — with three levels to spend, a fade is the
+same step moved somewhere else, plus two visible contour lines.
+
+### What it does instead
+
+Carry **four extra fractional bits** of brightness and resolve them **spatially**: light a
+pixel one level brighter when its fraction beats that pixel's threshold in a 4×4 Bayer
+matrix. Averaged over a 4×4 cell that is **~16 apparent levels out of the 4 the pins can
+express**, so the tip reads as a gradient instead of a cliff.
+
+```
+  tip_dist = fill - depth              how far inside the bar this pixel is
+  f        = min(tip_dist >> fade_sh, 16)      the ramp, 0..16
+  scaled   = lvl * f                   lvl is 1..3, so this is a shift and an add
+  level    = scaled>>4  +  (scaled[3:0] > bayer4(px, py))
+```
+
+Nothing is stored. The dither is a function of `(px, py)` like every other effect here, which
+is what makes it legal in a racing-the-beam renderer with no frame buffer.
+
+### Why it is cheap — the four things that could each have been expensive
+
+| Would normally need | What we do instead |
+| --- | --- |
+| A 16-entry × 4-bit LUT for the Bayer matrix | The Bayer construction has a **closed form**: for 4×4 it collapses to `{v0, y0, v1, y1}` with `v = px ^ py`. **Two XOR gates and wires.** |
+| A divide, to normalise the ramp | Ramp widths are **powers of two only**, so normalisation is `tip_dist >> fade_sh` — a wire slice plus a 4:1 mux |
+| A multiplier for `lvl × f` | `lvl` is 1, 2 or 3, so it is `f + 2f` with each term gated — one 6-bit adder |
+| A subtractor for `tip_dist` | Shares the one the `lit` comparison already needs |
+
+The preview used a **24 px** ramp, which reads well but needs a divide to normalise — there
+is no divider on this chip and no room for one. 24 sits between the 16 and 32 settings;
+firmware picks whichever looks right on the actual monitor.
+
+### The one behavioural change worth knowing
+
+A lit pixel **can** come out at level 0 near the tip. That is the effect, and it is the one
+place the "a lit pixel is never level 0" rule of §4 is deliberately relaxed — but only when
+firmware turns it on. It does mean a **very quiet band**, whose whole bar is shorter than the
+ramp, gets dimmer than it used to. Firmware's answer is a narrower `fade_sh`, or the fade off.
+
+Everything else holds unchanged, and is tested rather than asserted: **silence stays perfectly
+black**, blanking stays black, and the fade can only ever *subtract* brightness — it never
+brightens a pixel and never overflows the 2-bit channel (a wrapped tip would read as a black
+notch, the most visible artefact available).
+
+---
+
 ## 5. Refresh timing
 
 `vga_timing` emits `frame_start`, a one-clock pulse at the beginning of vertical blanking.
-That asks `fft_ctrl` — the chip's single bus master — to stream 17 `CFGRD`s and write each
+That asks `fft_ctrl` — the chip's single bus master — to stream 19 `CFGRD`s and write each
 returned value into `visual_state`.
 
 - Blanking is **183,168 clocks per frame** (27.6 % of 663,168); the refresh needs well under
@@ -146,6 +262,99 @@ returned value into `visual_state`.
 
 ---
 
+## 5b. The look config — five firmware knobs
+
+Config word 17 selects how the chip renders, and **every field is designed so that zero
+means "as before"**:
+
+| Bits | Field | Values |
+| --- | --- | --- |
+| `[0]` | **B&W** | 0 = colour, 1 = greyscale (all three channels driven equally) |
+| `[2:1]` | **palette** | 0 classic (red/magenta/cyan/green), 1 ice, 2 fire, 3 neon |
+| `[4:3]` | **dim** | 0 = full brightness … 3 = black. Applied as the saturation ceiling, so it dims the kick flash too |
+
+And config word **18** is a fourth knob: **breathing amplitude**, 0–31 in 2-pixel units
+(0 = off, 31 = 62 px).
+
+Config word **19** is the fifth: the **soft fade + ordered dither** on each bar's tip.
+
+| Bits | Field | Values |
+| --- | --- | --- |
+| `[0]` | **fade_en** | 0 = hard bar tip (exactly as before), 1 = soften it |
+| `[2:1]` | **fade_sh** | ramp width `16 << fade_sh` px: 16 / 32 / 64 / 128 |
+| `[4:3]` | reserved | must be written 0 |
+
+See §4b for what it does and why it is cheap.
+
+**Why dim and not cap:** an unwritten MCU config region reads back 0. Encoding brightness as
+a *cap* would make 0 mean "black screen", so any firmware that forgot the config would ship a
+dead display. As a *dim* amount, 0 means full brightness and the failure mode is benign.
+
+**These are physical-knob ready at zero silicon cost.** A pot → RP2350 ADC → firmware → this
+config word. The chip never knows a knob exists.
+
+Note the wider point about knobs: anything expressible as *"change the numbers the MCU
+publishes"* — sensitivity, attack/decay, beat threshold, bin→band mapping, bass/treble
+balance — is **already free** and needs no config bits at all. Only knobs that change how the
+chip *interprets* the numbers need silicon. Another 5-bit config word costs ~30 GE plus
+whatever logic it gates.
+
+---
+
+## 5c. DESIGN PRINCIPLE — everything should be knob-able
+
+**Decided with Giel, 2026-08-27. Apply this to every visual parameter added from here on.**
+
+When adding a visual parameter, the default assumption is that it should be **live-adjustable
+from a physical knob**, and it needs a reason *not* to be. A DJ visualiser that can only be
+retuned by reflashing firmware is a worse instrument than one with a brightness knob, and on
+this architecture the knob is usually free.
+
+**The chain:** pot → RP2350 ADC → firmware → config word in the MCU's config region → chip
+fetches it in the vblank refresh. **The chip never knows a knob exists.**
+
+### The two classes — check which one a new parameter falls into
+
+| | Cost | Examples |
+| --- | --- | --- |
+| **Free knobs** — expressible as *"change the numbers the MCU publishes"* | **zero silicon, zero config bits** | sensitivity / gain, attack & decay, beat threshold, bin→band mapping, bass/treble balance, freeze, per-band trim |
+| **Silicon knobs** — change how the chip *interprets* the numbers | ~30 GE per 5-bit config word, plus the logic it gates, **and it lands on the `uo_out` critical path** | palette, B&W, brightness cap (all built), effect enables, breathing speed |
+
+Always ask whether a parameter can be moved into the first row. Most can: because the MCU
+computes the band values, anything that is a transform *of those values* is free.
+
+### If the demo board runs short of ADC pins
+
+A pin shortage does **not** have to mean fewer knobs — these are all board/firmware level,
+zero silicon:
+
+- **Analog mux** (e.g. 74HC4051): 8 pots on 1 ADC pin + 3 GPIO.
+- **One pot + a button** that cycles which parameter the pot is editing.
+- **Rotary encoder** on 2 GPIO, no ADC at all.
+
+⚠ **Open question:** how many ADC-capable pins the TT demo board actually leaves free, given
+the RP2350 is already generating the 40 MHz clock and running hard-real-time PIO bus service.
+Confirm this before committing to a knob count.
+
+### Priority order, if we must choose
+
+Should pins genuinely be scarce, add knobs in this order:
+
+1. **Brightness / dim** — the control a DJ reaches for most, because room lighting changes. *(silicon: built)*
+2. **Sensitivity / gain** — essential to adapt to track loudness. *(free)*
+3. **Palette** — the mood control. *(silicon: built)*
+4. **Beat sensitivity** — how hard the kick punches. *(free)*
+5. **B&W** — a switch rather than a pot, so it can use a spare GPIO. *(silicon: built)*
+6. **Effect intensity / enables** — once Phase 5's effects exist. *(silicon: not yet built)*
+
+Note items 2 and 4 need **no silicon at all**, so they should be wired even if the config
+word is full.
+
+---
+
+
+**Added 2026-08-28:** the fade (word 19) joins this list. It is a good knob candidate -- the right softness depends on the room, the projector and how far away the audience is, which is exactly the kind of thing nobody gets right on paper.
+
 ## 6. Frozen vs firmware — read this before tape-out
 
 ### Frozen in silicon (cannot change after tape-out)
@@ -153,6 +362,10 @@ returned value into `visual_state`.
 - Zone **geometry**: which pixels belong to each zone, cell sizes, fill directions, `MUL`.
 - Zone **hue** — the bottom strip is red, permanently.
 - The brightness curve (top 2 bits, floored at 1) and flash saturation.
+- The fade's **shape** (a linear ramp), its **dither pattern** (4x4 Bayer) and the four ramp
+  widths it can be set to. **Whether it is on, and which width, are firmware** (word 19).
+- The breathing effect's triangle shape, its ~4.3 s period, and its 62 px hardware
+  ceiling. **The amplitude itself is firmware-controlled** (config word 18).
 - `visual_state`'s **shape**: 16 bands × 5 bits + 5-bit flash, and its CFG address map.
 - VGA mode (800×600, all porches, both sync polarities) and the Pmod pin packing.
 - FFT size (512 points) and the bus protocol.
@@ -168,6 +381,9 @@ returned value into `visual_state`.
 - Attack/decay envelopes — a bar that snaps up and falls back slowly costs **zero silicon**.
 - Beat threshold and sensitivity; sample rate, decimation, windowing, gain and what counts
   as "full scale".
+- **Bar-tip softness**: fade on/off and the ramp width, config word 19. Note this one
+  interacts with the band values -- a very quiet band is shorter than a wide ramp and so is
+  dimmed by it, which firmware compensates with a narrower width or more gain.
 
 ### 🔴 The dependency that makes all of the above real
 
@@ -187,10 +403,17 @@ Costed and discussed in `PART2_VISUALS_VGA_PLAN.md` § *Firmware-tunable visuals
 | Brightness cap | ~15 GE | dim the whole scene |
 | Palette select | ~80 GE | 4 hue sets |
 | **Per-zone hue in `visual_state`** | **~290 GE** | full firmware colour control |
-| **Soft fade to black + 4×4 ordered dither** | **~180 GE** | ~16 apparent levels per channel instead of 4; kills the blocky edges |
+| ~~Soft fade + 4×4 ordered dither~~ | ~~~180 GE~~ | **BUILT 2026-08-28** — see §4b |
 
-The last two compete for the same gates: per-zone hue is *insurance* (a wrong colour becomes
-a firmware edit), fade+dither is *aesthetics*. Decide against the post-harden number.
+**Do not read the old ~180 GE as the delivered cost.** The two expensive pieces were
+avoided — the Bayer matrix has a closed form (two XORs, not a 16-entry LUT) and the ramp
+widths are powers of two (a wire slice, not a divider) — but the build also added a fifth
+config word (5 DFFs + decode) and 4 pipeline flops that the estimate never counted. A hand
+count lands somewhere around **200–250 GE**, and hand counts of this design have been
+**30% apart** before. **The harden report is the number.**
+
+**Per-zone hue is now the only remaining item on the list.** Decide it against the
+utilisation taken *with* the fade in place, not the old 70%.
 
 Note the "more than 4 colours" question: the Pmod ceiling is 64 colours, and the limit is 4
 *levels per channel*, not 4 colours. The headroom is already there — the current design

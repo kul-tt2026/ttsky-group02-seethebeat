@@ -165,15 +165,28 @@ response on `ui_in`/`resp_valid`, same in-order pipelining and the same
 `MAX_OUTSTANDING = 4`. Only the opcode nibble differs, so the MCU-side PIO can share one
 capture datapath and simply branch on the opcode when servicing.
 
-**The config region layout (v1)** — 17 words, one value per word, low bits only:
+**The config region layout (v1)** — 20 words, one value per word, low bits only:
 
 | CFG addr | Meaning | Bits used |
 | --- | --- | --- |
 | `0` … `15` | `visual_state` band 0…15 (0 = lowest frequency) | `[4:0]` |
 | `16` | global kick-flash level | `[4:0]` |
-| `17`+ | reserved (the chip ignores them today) | — |
+| `17` | **look config**: `{dim[1:0], palette[1:0], bw}` | `[4:0]` |
+| `18` | **breathing amplitude**, in 2-pixel units (0 = off, 31 = 62 px) | `[4:0]` |
+| `19` | **fade config**: `{--, fade_sh[1:0], fade_en}` (0 = hard bar tips) | `[2:0]` |
+| `20`+ | reserved (the chip ignores them today) | — |
 
-The chip reads all 17 back-to-back at the start of vertical blanking and latches them. The
+**Config word 19** enables the soft fade + 4×4 ordered dither on each bar's tip.
+`fade_en` turns it on; `fade_sh` selects the ramp width, `16 << fade_sh` pixels, so
+16 / 32 / 64 / 128. Bits `[4:3]` are reserved and must be written 0.
+
+**Config words 17 and 19 are designed so that ALL-ZERO means "classic look"** — full colour, palette
+0, full brightness. That is a safety property, not a convenience: an unwritten config region
+reads back 0, so firmware that only publishes bands still gets a normal picture. It is why
+brightness is encoded as a *dim* amount rather than a *cap* (a cap of 0 would blank the
+screen on any firmware that forgot to set it).
+
+The chip reads all 20 back-to-back at the start of vertical blanking and latches them. The
 upper bits of each returned word are ignored, so firmware may pack extra information there
 later without a silicon change.
 

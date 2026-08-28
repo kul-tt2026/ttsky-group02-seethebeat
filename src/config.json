@@ -17,7 +17,17 @@
 
   "//": "CLOCK_PERIOD - Increase this in case you are getting setup time violations.",
   "//": "The value is in nanoseconds, so 20ns == 50MHz.",
-  "CLOCK_PERIOD": 20,
+
+  "//": "CHANGED 2026-08-27: 20 -> 25 ns, i.e. 50 MHz -> 40 MHz.",
+  "//": "This is NOT a relaxation to dodge a problem -- it is a correction. The chip RUNS at",
+  "//": "40 MHz (info.yaml clock_hz = 40000000, the VGA 800x600@60 pixel clock), so signing",
+  "//": "off at 20 ns was constraining it 25% harder than reality for no benefit.",
+  "//": "At 20 ns the setup repair started at WNS -4.957 ns over 53 violating endpoints and",
+  "//": "only reached +0.064 ns -- 0.3% margin, which is not margin at all. The critical",
+  "//": "endpoint was uo_out[4] (the red LSB), i.e. the pixel_gen combinational cone.",
+  "//": "Note 40 MHz is our real limit anyway: the demo board tops out at 66.5 MHz and the",
+  "//": "VGA mode fixes the pixel clock, so there is nothing to gain from a 50 MHz sign-off.",
+  "CLOCK_PERIOD": 25,
 
   "//": "Hold slack margin - Increase them in case you are getting hold violations.",
   "PL_RESIZER_HOLD_SLACK_MARGIN": 0.1,

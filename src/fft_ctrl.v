@@ -22,12 +22,13 @@ module fft_ctrl #(
     parameter integer LOGN = 9,       // log2(N); N = 512 for the real chip
     parameter integer DW   = 16,      // Q1.15 component width
     parameter integer ANGW = 20,      // CORDIC angle width (2^ANGW = full circle)
-    parameter integer VS_N = 17,      // visual_state words to fetch: 16 bands + flash
+    parameter integer VS_N = 20,      // visual_state words: 16 bands + flash + 3 config
     parameter integer VS_W = 5        // bits kept from each fetched word
 ) (
     input  wire       clk,
     input  wire       rst_n,
     input  wire       start,          // pulse: begin (data already loaded, bit-reversed)
+                                    //   latched -- see start_pending
     output reg        done,           // 1-cycle pulse when the in-place FFT is complete
 
     // ---- visual_state refresh (Part 2): pulse `refresh_req` in vblank; the fetched
@@ -93,6 +94,15 @@ module fft_ctrl #(
 
   // ---- visual_state refresh counters (issue / collect), one per fetched word ----
   reg [4:0]    vi, vc;
+
+  // ---- START IS LATCHED, NOT SAMPLED ----
+  // `start` is a one-cycle pulse derived from the frame-ready edge, and it is only acted on
+  // in S_IDLE. Without this latch a frame-ready arriving while a transform is running -- or
+  // during the once-per-frame visual_state refresh, which is a window the MCU cannot see --
+  // would be silently DROPPED, and the MCU would wait forever for a transform that never
+  // started. Neither `done` nor `busy` reaches a pin, so the MCU has no way to detect it
+  // either. One flop removes the whole failure mode.
+  reg          start_pending;
 
   // ---- the CORDIC ALU (butterfly + the one CORDIC) ----
   wire          bf_start = !bf_started && (state == S_COMP);
@@ -164,21 +174,26 @@ module fft_ctrl #(
       angle_step <= {ANGW{1'b0}}; angle_acc <= {ANGW{1'b0}};
       ri <= 3'd0; rc <= 3'd0; wi <= 3'd0; bf_started <= 1'b0;
       a_re <= 0; a_im <= 0; b_re <= 0; b_im <= 0;
-      vi <= 5'd0; vc <= 5'd0;
+      vi <= 5'd0; vc <= 5'd0; start_pending <= 1'b0;
       vs_wr_en <= 1'b0; vs_wr_addr <= 5'd0; vs_wr_data <= {VS_W{1'b0}};
     end else begin
       done <= 1'b0;
       vs_wr_en <= 1'b0;
+      // Remember a start that lands while we are busy. Placed BEFORE the case so that the
+      // clear inside S_IDLE (a later assignment in the same block) wins when a pulse and a
+      // launch coincide -- i.e. it is consumed, not left pending.
+      if (start) start_pending <= 1'b1;
       case (state)
         S_IDLE: begin
-          // The FFT wins if both arrive together: a transform is time-critical, a refresh
-          // is not. A refresh is only ever accepted from IDLE, so it can never interleave
+          // The FFT wins if both arrive together -- including a start that was latched
+          // while we were busy: a transform is time-critical, a refresh is not. A refresh is only ever accepted from IDLE, so it can never interleave
           // with FFT traffic -- which matters because mcu_bus returns responses strictly
           // in order with no tags, so two interleaved readers would mis-route each other's
           // data. If a transform is still running at vblank the refresh is simply SKIPPED
           // for that frame; the visuals hold their previous values for one frame, which is
           // imperceptible at 60 Hz.
-          if (start) begin
+          if (start || start_pending) begin
+            start_pending <= 1'b0;                     // consumed
             s <= S_ONE; half <= IX_ONE;                // stage 1, half = 1
             kstart <= {KW{1'b0}}; j <= {IXW{1'b0}};
             angle_step <= ANG_STEP0; angle_acc <= {ANGW{1'b0}};

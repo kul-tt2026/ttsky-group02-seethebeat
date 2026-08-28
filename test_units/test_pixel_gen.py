@@ -19,7 +19,8 @@ import os
 import sys
 
 import cocotb
-from cocotb.triggers import Timer
+from cocotb.clock import Clock
+from cocotb.triggers import ClockCycles, RisingEdge, Timer
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "model"))
 import visual_ref as V  # noqa: E402
@@ -29,12 +30,42 @@ ALL_OFF = [0] * V.NBANDS
 ALL_FULL = [V.BAND_MAX] * V.NBANDS
 
 
-async def _check(dut, px, py, active, bands, flash):
-    """Drive a pixel through the real zone->band->colour chain and compare to the model."""
+async def _init(dut):
+    """pixel_gen is PIPELINED now, so it needs a clock and a reset. Each test starts its own
+    -- cocotb cancels a test's tasks when it ends, which is why test_vga_timing.py can do the
+    same thing in two tests without them colliding."""
+    cocotb.start_soon(Clock(dut.clk, 25, unit="ns").start())
+    dut.px.value = 0
+    dut.py.value = 0
+    dut.active.value = 0
+    dut.band.value = 0
+    dut.flash.value = 0
+    dut.frame.value = 0
+    dut.cfg.value = 0
+    dut.cfg2.value = 0
+    dut.cfg3.value = 0
+    dut.rst_n.value = 0
+    await ClockCycles(dut.clk, 3)
+    dut.rst_n.value = 1
+    await Timer(1, unit="ns")
+
+
+async def _check(dut, px, py, active, bands, flash, frame=0, cfg=0, cfg2=0, cfg3=0):
+    """Drive a pixel through the real zone->band->colour chain and compare to the model.
+
+    The chain is now split across a pipeline register: stage 1 decodes (px,py) -> zone and
+    visual_state answers with `band` in the SAME cycle; the clock edge captures
+    band/depth/group, and stage 2 produces the colour. So the colour for a pixel appears one
+    clock after its coordinates -- hence the RisingEdge below. The FUNCTION is unchanged,
+    which is why the golden model needs no pipeline of its own."""
     dut.px.value = px
     dut.py.value = py
     dut.active.value = 1 if active else 0
     dut.flash.value = flash
+    dut.frame.value = frame
+    dut.cfg.value = cfg
+    dut.cfg2.value = cfg2
+    dut.cfg3.value = cfg3
     await Timer(1, unit="ns")
 
     z = int(dut.zone.value)
@@ -43,17 +74,23 @@ async def _check(dut, px, py, active, bands, flash):
         assert z == exp_z, "({},{}) zone rtl={} model={}".format(px, py, z, exp_z)
 
     dut.band.value = bands[z]
-    await Timer(1, unit="ns")
+    await Timer(1, unit="ns")          # let the band settle into the stage-1 inputs
+    await RisingEdge(dut.clk)          # capture band/depth/group into the pipeline register
+    await Timer(1, unit="ns")          # stage 2 settles
 
     got = (int(dut.r.value), int(dut.g.value), int(dut.b.value))
-    exp = V.pixel(px, py, active, bands, flash) if active else (0, 0, 0)
-    assert got == exp, "({},{}) act={} flash={}: rtl={} model={}".format(
-        px, py, active, flash, got, exp)
+    exp = (V.pixel(px, py, active, bands, flash, frame, cfg, cfg2, cfg3)
+           if active else (0, 0, 0))
+    assert got == exp, (
+        "({},{}) act={} flash={} frame={} cfg={} cfg3={}: rtl={} model={}".format(
+            px, py, active, flash, frame, cfg, cfg3, got, exp))
+    return got
 
 
 @cocotb.test()
 async def test_region_seams(dut):
     """Every boundary between the four regions, and the pixels either side of it."""
+    await _init(dut)
     xs = [0, 1, V.WING_W - 1, V.WING_W, V.WING_W + 1,
           V.CENTRE_R - 1, V.CENTRE_R, V.CENTRE_R + 1, H - 2, H - 1]
     ys = [0, 1, V.BOTTOM_TOP - 1, V.BOTTOM_TOP, V.BOTTOM_TOP + 1, VV - 2, VV - 1]
@@ -67,6 +104,7 @@ async def test_region_seams(dut):
 async def test_zone_sub_splits(dut):
     """The sub-index boundaries inside each region -- 200 px bass columns, 120 px wing
     rows, 140 px centre columns. Off-by-one here swaps two bands on screen."""
+    await _init(dut)
     bands = V.DEFAULT_BANDS
     for k in range(1, 4):
         e = k * V.BOTTOM_SPLIT
@@ -85,6 +123,7 @@ async def test_zone_sub_splits(dut):
 async def test_fill_edge_at_every_band_value(dut):
     """For each band 0..31, check the exact pixel where the fill stops. This is the one
     comparison that makes the meter musical, so walk its edge across the whole range."""
+    await _init(dut)
     BASS_DEEP = VV - V.BOTTOM_TOP          # 240
     CENTRE_DEEP = V.BOTTOM_TOP             # 360
     for band in range(V.BAND_MAX + 1):
@@ -109,6 +148,7 @@ async def test_fill_edge_at_every_band_value(dut):
 @cocotb.test()
 async def test_silence_is_black(dut):
     """No music, no light -- the mostly-black DJ default."""
+    await _init(dut)
     for py in range(0, VV, 23):
         for px in range(0, H, 31):
             await _check(dut, px, py, True, ALL_OFF, 0)
@@ -118,6 +158,7 @@ async def test_silence_is_black(dut):
 async def test_blanking_forces_black(dut):
     """The single most important rule of the output path, checked at full scale so a
     broken gate cannot hide behind dark pixels."""
+    await _init(dut)
     pts = [(0, 0), (400, 300), (H - 1, VV - 1), (50, 550), (H, VV), (1055, 627)]
     for (px, py) in pts:
         await _check(dut, px, py, False, ALL_FULL, V.BAND_MAX)
@@ -128,6 +169,7 @@ async def test_blanking_forces_black(dut):
 async def test_flash_saturates_never_wraps(dut):
     """A wrapped flash would read as a BLACK frame exactly on the beat -- the worst
     possible artefact. Prove saturation across the whole flash range at full colour."""
+    await _init(dut)
     for flash in range(V.BAND_MAX + 1):
         for (px, py) in [(100, VV - 1), (400, 100), (0, 0), (H - 1, 200)]:
             await _check(dut, px, py, True, ALL_FULL, flash)
@@ -140,6 +182,7 @@ async def test_flash_saturates_never_wraps(dut):
 @cocotb.test()
 async def test_strided_sweep(dut):
     """Whole-area sweep on strides coprime to 200/120/140 so the phase keeps moving."""
+    await _init(dut)
     bands = [(i * 5 + 2) & V.BAND_MAX for i in range(V.NBANDS)]
     n = 0
     for py in range(0, VV, 17):
@@ -147,3 +190,247 @@ async def test_strided_sweep(dut):
             await _check(dut, px, py, True, bands, 3)
             n += 1
     dut._log.info("strided sweep: %d points, all bit-exact", n)
+
+
+@cocotb.test()
+async def test_breathing_edge_across_frames(dut):
+    """The Phase 1 animation: the fill threshold gains a time-varying offset, so a bar's tip
+    drifts in and out. Walk a full breathing cycle at the bar edge, where the effect lives.
+    """
+    await _init(dut)
+    bands = [8] * V.NBANDS
+    for amp in (0, 8, 31):
+        peak = min(amp * V.WOBBLE_STEP, V.WOBBLE_MAX)
+        for frame in range(0, 1 << V.FRAME_W, 9):
+            base = 8 * V.MUL_BASS
+            for depth in (base - 1, base, base + peak, base + peak + 1, base + 2):
+                if 0 <= depth < VV - V.BOTTOM_TOP:
+                    await _check(dut, 100, VV - 1 - depth, True, bands, 0, frame, 0, amp)
+
+
+@cocotb.test()
+async def test_silence_stays_black_at_every_frame(dut):
+    """The invariant the wobble could most easily break: it may extend a lit bar but must
+    never light a silent one, or the screen shimmers through quiet passages."""
+    await _init(dut)
+    for frame in range(0, 1 << V.FRAME_W, 11):
+        for (px, py) in [(100, VV - 1), (100, VV - 60), (0, 0), (60, 200),
+                         (400, 0), (400, 200), (799, 100), (260, 5)]:
+            await _check(dut, px, py, True, ALL_OFF, 0, frame, 0, 31)
+            assert (int(dut.r.value), int(dut.g.value),
+                    int(dut.b.value)) == (0, 0, 0), (
+                "silence lit up at frame {} ({},{})".format(frame, px, py))
+
+
+@cocotb.test()
+async def test_frame_zero_is_the_unanimated_picture(dut):
+    """wobble(0) == 0 by construction, so a frame-0 render must equal the static design --
+    which is what every other test in this file assumes when it omits `frame`."""
+    await _init(dut)
+    bands = V.DEFAULT_BANDS
+    for py in range(0, VV, 37):
+        for px in range(0, H, 41):
+            await _check(dut, px, py, True, bands, 0, 0)
+
+
+@cocotb.test()
+async def test_every_config_value(dut):
+    """All 32 values of the config register, sampled across the screen. cfg selects the
+    palette, greyscale and the brightness ceiling -- all of which sit on the critical
+    uo_out path, so a decode slip here is both visible and timing-relevant."""
+    await _init(dut)
+    for cfg in range(1 << V.BAND_W):
+        for py in range(0, VV, 97):
+            for px in range(0, H, 89):
+                await _check(dut, px, py, True, V.DEFAULT_BANDS, 9, 61, cfg)
+
+
+@cocotb.test()
+async def test_cfg_zero_matches_the_original_design(dut):
+    """The safety property: an unwritten MCU config region reads back 0, so cfg == 0 must
+    render exactly the classic look -- full colour, full brightness, palette 0."""
+    await _init(dut)
+    for py in range(0, VV, 43):
+        for px in range(0, H, 47):
+            await _check(dut, px, py, True, V.DEFAULT_BANDS, 5, 33, 0)
+
+
+@cocotb.test()
+async def test_bw_and_dim_extremes(dut):
+    """Greyscale must give r == g == b; full dim must black the screen even at full scale."""
+    await _init(dut)
+    bw = 1 << V.CFG_BW_BIT
+    for py in range(0, VV, 53):
+        for px in range(0, H, 59):
+            await _check(dut, px, py, True, ALL_FULL, 0, 0, bw)
+            assert int(dut.r.value) == int(dut.g.value) == int(dut.b.value), (
+                "B&W not grey at ({},{})".format(px, py))
+
+    black = 3 << V.CFG_DIM_SHIFT
+    for py in range(0, VV, 53):
+        for px in range(0, H, 59):
+            await _check(dut, px, py, True, ALL_FULL, 31, 0, black)
+            assert (int(dut.r.value), int(dut.g.value), int(dut.b.value)) == (0, 0, 0), (
+                "full dim must black everything, even the kick flash")
+
+
+@cocotb.test()
+async def test_breathing_amplitude_is_firmware_controlled(dut):
+    """cfg2 (config word 18) sets the breathing amplitude. Two things matter: 0 must hold
+    the bar perfectly still, and a higher setting must visibly move it -- the original fixed
+    7 px was below one band step in the bass and centre, so it could not be seen at all."""
+    await _init(dut)
+    bands = [8] * V.NBANDS
+    col, base = 100, 8 * V.MUL_BASS
+
+    def lit_at(frame_vals, amp):
+        return frame_vals, amp
+
+    for amp, expect in ((0, 0), (8, min(8 * V.WOBBLE_STEP, V.WOBBLE_MAX)),
+                        (31, min(31 * V.WOBBLE_STEP, V.WOBBLE_MAX))):
+        seen = set()
+        for frame in range(0, 1 << V.FRAME_W, 7):
+            n = 0
+            for depth in range(base - 2, min(base + V.WOBBLE_MAX + 2, VV - V.BOTTOM_TOP)):
+                await _check(dut, col, VV - 1 - depth, True, bands, 0, frame, 0, amp)
+                if (int(dut.r.value), int(dut.g.value), int(dut.b.value)) != (0, 0, 0):
+                    n += 1
+            seen.add(n)
+        span = max(seen) - min(seen)
+        assert span == expect, "amp {}: bar breathed {} px, expected {}".format(
+            amp, span, expect)
+
+
+# ======================= soft fade + ordered dither (config word 19) =======================
+
+def _fade_cfg(sh, en=1):
+    return (en & 1) | (sh << V.CFG3_FADE_SH_SHIFT)
+
+
+@cocotb.test()
+async def test_cfg3_zero_is_the_original_design(dut):
+    """The all-zero rule for the third config word: an unwritten MCU config region reads
+    back 0, so cfg3 == 0 must render exactly the hard-edged bar that existed before the fade.
+    _check compares against the model, which is itself pinned to the pre-fade behaviour by
+    model/test_visual_ref.py -- so this closes the loop on the RTL side."""
+    await _init(dut)
+    for py in range(0, VV, 41):
+        for px in range(0, H, 37):
+            await _check(dut, px, py, True, V.DEFAULT_BANDS, 5, 33, 0, 4, 0)
+
+
+@cocotb.test()
+async def test_fade_at_every_setting(dut):
+    """All 32 values of cfg3 -- both the three live bits and the two reserved ones, which
+    MUST be ignored. Sampled on strides coprime to the zone splits so the dither phase keeps
+    moving instead of locking onto one 4x4 alignment."""
+    await _init(dut)
+    bands = [(i * 3 + 5) & V.BAND_MAX for i in range(V.NBANDS)]
+    for cfg3 in range(1 << V.BAND_W):
+        for py in range(0, VV, 101):
+            for px in range(0, H, 83):
+                await _check(dut, px, py, True, bands, 7, 41, 0b01010, 6, cfg3)
+
+
+@cocotb.test()
+async def test_reserved_cfg3_bits_change_nothing(dut):
+    """cfg3[4:3] are reserved. If a future knob is wired there by accident, this fires
+    before it reaches silicon."""
+    await _init(dut)
+    bands = V.DEFAULT_BANDS
+    for sh in range(4):
+        live = _fade_cfg(sh)
+        for py in range(0, VV, 71):
+            for px in range(0, H, 67):
+                a = await _check(dut, px, py, True, bands, 3, 17, 0, 0, live)
+                b = await _check(dut, px, py, True, bands, 3, 17, 0, 0, live | 0b11000)
+                assert a == b, "reserved cfg3 bits changed ({},{}): {} vs {}".format(
+                    px, py, a, b)
+
+
+@cocotb.test()
+async def test_fade_walks_a_bass_bar_from_tip_to_base(dut):
+    """Walk straight down a lit bass bar, from just past its tip to deep inside it, at every
+    ramp width. Three properties must hold everywhere: the fade never brightens a pixel past
+    its un-faded value, it reaches the un-faded value once past the ramp, and it agrees with
+    the model at every single depth."""
+    await _init(dut)
+    band = 24                                   # top bits 11 -> level 3, the widest range
+    bands = [band] * V.NBANDS
+    fill = band * V.MUL_BASS                    # 192 px of lit bar
+    col = 100                                   # inside bass zone 0
+    for sh in range(4):
+        cfg3 = _fade_cfg(sh)
+        width = V.FADE_STEPS << sh
+        for depth in range(0, min(fill, VV - V.BOTTOM_TOP)):
+            py = VV - 1 - depth
+            soft = await _check(dut, col, py, True, bands, 0, 0, 0, 0, cfg3)
+            hard = await _check(dut, col, py, True, bands, 0, 0, 0, 0, 0)
+            assert all(soft[c] <= hard[c] for c in range(3)), (
+                "fade brightened depth {} (sh={})".format(depth, sh))
+            if fill - depth > width:             # past the ramp -> untouched
+                assert soft == hard, (
+                    "sh={}: bar not at full brightness {} px behind the tip".format(
+                        sh, fill - depth))
+
+
+@cocotb.test()
+async def test_dither_actually_varies_across_a_row(dut):
+    """The dither must produce DIFFERENT levels for neighbouring pixels at the same depth --
+    that spatial mix is the whole mechanism. In the bass zone depth depends only on py, so a
+    horizontal run inside one zone has a constant band AND a constant depth, and any
+    variation in the output can only have come from the Bayer threshold.
+
+    The row is chosen by asking the MODEL where a mix exists, then requiring the RTL to
+    reproduce it -- rather than hardcoding a magic py that a future geometry change would
+    silently turn into a uniform row (which would leave the test green and empty)."""
+    await _init(dut)
+    band, sh = 24, 1
+    bands = [band] * V.NBANDS
+    cfg3 = _fade_cfg(sh)
+    fill = band * V.MUL_BASS
+
+    target = None
+    for depth in range(fill - 1, max(fill - (V.FADE_STEPS << sh), 0), -1):
+        py = VV - 1 - depth
+        levels = {V.pixel(px, py, True, bands, 0, 0, 0, 0, cfg3)[0] for px in range(8)}
+        if len(levels) > 1:
+            target = py
+            break
+    assert target is not None, "model shows no dithered row -- the effect is not working"
+
+    seen = set()
+    for px in range(16):
+        seen.add((await _check(dut, px, target, True, bands, 0, 0, 0, 0, cfg3))[0])
+    assert len(seen) > 1, (
+        "RTL row at py={} is uniform {} -- the dither is not reaching the pins".format(
+            target, seen))
+    dut._log.info("dithered row py=%d shows levels %s", target, sorted(seen))
+
+
+@cocotb.test()
+async def test_fade_never_lights_a_silent_band(dut):
+    """The invariant that outranks every effect. The fade only ever subtracts from a lit
+    pixel, so silence must stay perfectly black at every setting, every frame."""
+    await _init(dut)
+    for sh in range(4):
+        cfg3 = _fade_cfg(sh)
+        for frame in (0, 64, 200):
+            for py in range(0, VV, 79):
+                for px in range(0, H, 73):
+                    got = await _check(dut, px, py, True, ALL_OFF, 0, frame, 0, 31, cfg3)
+                    assert got == (0, 0, 0), "silence lit at ({},{})".format(px, py)
+
+
+@cocotb.test()
+async def test_fade_respects_the_blanking_gate(dut):
+    """Light in the porches makes a monitor refuse to lock. The fade sits late in the pixel
+    path, after the level mux, so it is exactly the kind of change that could slip past the
+    gate."""
+    await _init(dut)
+    for sh in range(4):
+        cfg3 = _fade_cfg(sh)
+        for py in range(0, VV, 91):
+            for px in range(0, H, 87):
+                got = await _check(dut, px, py, False, ALL_FULL, 31, 77, 0, 0, cfg3)
+                assert got == (0, 0, 0), "lit during blanking at ({},{})".format(px, py)

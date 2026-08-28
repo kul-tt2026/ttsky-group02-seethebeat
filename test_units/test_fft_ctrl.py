@@ -40,6 +40,18 @@ import fft_ref                # noqa: E402
 import visual_ref             # noqa: E402
 
 
+# EVERYTHING RUNS AS ONE @cocotb.test(). Two separate tests each starting their own Clock
+# and _slave_proc turned out to be a source of cross-test coupling whose exact behaviour
+# depends on the cocotb version (2.x cancels a test's tasks at its end, 1.x does not), and it
+# produced a failure that looked like an RTL bug: passing at MCU latency 0 and 2, failing at
+# 5. One test, one clock, one slave removes the whole class -- and the FFT and the refresh
+# share a bus anyway, so exercising them in one continuous simulation is the honest model.
+#
+# how many words a refresh fetches -- derived from the model so it cannot go stale when a
+# config word is added (test_geometry_sync checks fft_ctrl.v's VS_N against the same value)
+VS_WORDS = visual_ref.CFG3_ADDR + 1
+
+
 def _signed(v):
     v &= 0xFFFF
     return v - 0x10000 if v & 0x8000 else v
@@ -168,31 +180,23 @@ async def test_fft_ctrl(dut):
     # recover: reset chip + MCU, reload fresh input, and a clean FFT must complete correctly
     await _scenario(dut, st, N, _twotone(N), latency=2)
 
+    # ---- and the visual_state refresh, on the same clock and the same slave ----
+    await _check_visual_state_refresh(dut, st, N)
 
-@cocotb.test()
-async def test_visual_state_refresh(dut):
-    """The once-per-frame visual_state fetch: 17 config-reads, written out in order.
+
+async def _check_visual_state_refresh(dut, st, N):
+    """The once-per-frame visual_state fetch: VS_WORDS config-reads, written out in order.
 
     Three things are worth proving and none are obvious from reading the FSM:
-      1. the values land at addresses 0..16 IN ORDER (mcu_bus responses carry no tags, so
+      1. the values land at addresses 0..VS_WORDS-1 IN ORDER (mcu_bus responses carry no tags, so
          the n-th word is only correct because it is the n-th response);
       2. it reads the CONFIG space, not the FFT buffer -- they share the same 10-bit
          address numbers and only the opcode separates them;
       3. a refresh requested while a transform is running is SKIPPED, not interleaved --
          interleaving would mis-route both readers' data.
     """
-    logn = 6
-    try:
-        logn = int(dut.LOGN.value)
-    except Exception:
-        pass
-    N = 1 << logn
-
-    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
-    st = {"slave": None, "stalled": False}
-    cocotb.start_soon(_slave_proc(dut, st))
-
-    vals = [(i * 3 + 1) & 31 for i in range(16)] + [23]
+    # one distinct value per fetched word, so a shift by one is unmistakable
+    vals = [((i * 3 + 1) & 31) for i in range(VS_WORDS)]
 
     for latency in (0, 2, 5):
         sl = bus.MCUSlave(latency=latency)
@@ -212,13 +216,19 @@ async def test_visual_state_refresh(dut):
             await Timer(1, unit="ns")
             if dut.vs_wr_en.value.is_resolvable and int(dut.vs_wr_en.value) == 1:
                 writes.append((int(dut.vs_wr_addr.value), int(dut.vs_wr_data.value)))
-            if len(writes) == 17:
+            if len(writes) == VS_WORDS:
                 break
+        # let the fetch finish completely before the next pass -- breaking out mid-refresh
+        # would leave reads in flight across the reset, which is exactly the kind of
+        # leftover state that makes a test pass at one latency and fail at another
+        await ClockCycles(dut.clk, 40)
 
-        assert len(writes) == 17, "latency {}: got {} writes, expected 17".format(
-            latency, len(writes))
-        assert [a for a, _ in writes] == list(range(17)),             "latency {}: addresses out of order: {}".format(latency, [a for a, _ in writes])
-        assert [d for _, d in writes] == vals,             "latency {}: data {} != {}".format(latency, [d for _, d in writes], vals)
+        assert len(writes) == VS_WORDS, "latency {}: got {} writes, expected {}".format(
+            latency, len(writes), VS_WORDS)
+        assert [a for a, _ in writes] == list(range(VS_WORDS)), (
+            "latency {}: addresses out of order: {}".format(latency, [a for a, _ in writes]))
+        assert [d for _, d in writes] == vals, (
+            "latency {}: data {} != {}".format(latency, [d for _, d in writes], vals))
         assert sl.sram[0] == 0xDEAD, "a config fetch must not touch the FFT buffer"
 
     # ---- a refresh during a transform must be skipped, and must not corrupt the FFT ----
@@ -241,3 +251,26 @@ async def test_visual_state_refresh(dut):
 
     await _wait_done(dut)
     _check(st["slave"], x, N)                   # and the FFT result is still bit-exact
+
+    # ---- a start that lands DURING a refresh must be LATCHED, not dropped ----
+    # `start` is a one-cycle pulse from the frame-ready edge and is only acted on in S_IDLE.
+    # Before start_pending existed, a frame-ready arriving while the once-per-frame refresh
+    # was in flight was silently lost -- and since neither `done` nor `busy` reaches a pin,
+    # the MCU would have waited forever for a transform that never began. The refresh window
+    # is invisible to the MCU, so it cannot avoid this by timing.
+    x2 = _fullscale(N)
+    sl2 = _load(N, x2, 2)
+    for a in range(VS_WORDS):
+        sl2.cfg[a] = (a * 5 + 2) & 31
+    st["slave"] = sl2
+    st["stalled"] = False
+    await _reset(dut)
+
+    dut.refresh_req.value = 1
+    await RisingEdge(dut.clk)
+    dut.refresh_req.value = 0
+    await ClockCycles(dut.clk, 6)               # refresh is now well in flight
+    await _go(dut)                              # ... and the frame-ready edge lands here
+    await _wait_done(dut, limit=200000)         # it must still run to completion
+    _check(sl2, x2, N)                          # and be bit-exact -- the start was queued
+                                                # behind the refresh, not lost to it
