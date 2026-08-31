@@ -8,6 +8,11 @@ TOPLEVEL_LANG   ?= verilog
 SRC_DIR          = $(PWD)/../src
 PROJECT_SOURCES  = cordic.v butterfly.v fft_alu.v mcu_bus.v fft_ctrl.v vga_timing.v pixel_gen.v visual_state.v project.v
 
+# The test sizes its loops by this: gate-level simulation is far slower than
+# RTL, so it runs shorter windows there. Exported so the cocotb PROCESS can
+# see it, not just make.
+export GATES
+
 ifneq ($(GATES),yes)
 
 # RTL simulation:
