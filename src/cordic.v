@@ -65,7 +65,22 @@ module cordic #(
   reg signed [XYW-1:0]  x_reg, y_reg;
   reg signed [ZW-1:0]   z_reg;
 
-  wire scaling = (state == ST_SCALE);
+  // ---- `scaling` is REPLICATED, deliberately. Do not collapse these back into one. ----
+  // This one select drives ~51 mux bits spread across the whole CORDIC datapath, and at
+  // sign-off (2026-08-31) that made it the source of EVERY setup violation in the design:
+  // the resizer drove it with a 9-deep chain of `clkdlybuf4s25_1` (a clock DELAY buffer,
+  // drive strength 1), contributing 9.06 ns of a 26.40 ns path against a 25 ns period.
+  //
+  // Splitting the load across four copies gives the placer four small trees instead of one
+  // deep one. `(* keep *)` is load-bearing: without it Yosys CSEs them back to a single net
+  // and the fanout returns. All four are the same boolean, so this cannot change behaviour
+  // -- the bit-exact tests are unchanged and must stay green.
+  // (there is deliberately no undecorated `scaling` wire any more -- every consumer takes
+  //  one of the four copies below, and an unused one would trip Verilator's UNUSEDSIGNAL)
+  (* keep = "true" *) wire scaling_sh = (state == ST_SCALE);   // -> sh      (5 bits)
+  (* keep = "true" *) wire scaling_a  = (state == ST_SCALE);   // -> a_in   (22 bits)
+  (* keep = "true" *) wire scaling_b  = (state == ST_SCALE);   // -> b_in   (22 bits)
+  (* keep = "true" *) wire scaling_s  = (state == ST_SCALE);   // -> sub_x/sub_y (2 bits)
 
   // sign-extend inputs, then enter the guarded datapath (exact -- just a left shift;
   // worst-case internal magnitude is 610_505, at x_in = y_in = -32768. That needs 21 of
@@ -149,11 +164,11 @@ module cordic #(
   // ROTATE/VECTOR: nx = x -/+ (y >> i),  ny = y +/- (x >> i)
   // SCALE        : nx = x +/- (x >> p),  ny = y +/- (y >> p)   (same sign on both)
   wire                  d_pos = (mode_reg == MODE_ROTATE) ? (z_reg >= 0) : (y_reg < 0);
-  wire [4:0]            sh    = scaling ? sc_p  : i;
-  wire signed [XYW-1:0] a_in  = scaling ? x_reg : y_reg;   // operand of the nx shifter
-  wire signed [XYW-1:0] b_in  = scaling ? y_reg : x_reg;   // operand of the ny shifter
-  wire                  sub_x = scaling ? sc_neg : d_pos;
-  wire                  sub_y = scaling ? sc_neg : !d_pos;
+  wire [4:0]            sh    = scaling_sh ? sc_p  : i;
+  wire signed [XYW-1:0] a_in  = scaling_a  ? x_reg : y_reg;   // operand of the nx shifter
+  wire signed [XYW-1:0] b_in  = scaling_b  ? y_reg : x_reg;   // operand of the ny shifter
+  wire                  sub_x = scaling_s  ? sc_neg : d_pos;
+  wire                  sub_y = scaling_s  ? sc_neg : !d_pos;
 
   wire signed [XYW-1:0] a_sh = a_in >>> sh;   // arithmetic (sign-preserving)
   wire signed [XYW-1:0] b_sh = b_in >>> sh;
