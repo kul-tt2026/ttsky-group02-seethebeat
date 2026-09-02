@@ -189,7 +189,8 @@ async def _pulse_reset(dut, cycles=7):
 async def _drive_bus(dut, slave, n_clocks, frame_ready=1):
     """Play the MCU memory slave at the pins for `n_clocks`, decoding what the chip emits.
 
-    Returns (ops, addrs): how many of each opcode were framed, and every address seen.
+    Returns (ops, addrs, dec): opcode counts, every address seen, and the framing
+    state it ended in -- "IDLE" means the last command completed cleanly.
 
     The decode is done here rather than trusting the slave model, so command FRAMING is
     checked independently: a T0 must carry a legal opcode, and a READ/WRITE T0 must be
@@ -234,7 +235,7 @@ async def _drive_bus(dut, slave, n_clocks, frame_ready=1):
         await ClockCycles(dut.clk, 1)
         await _settle()
 
-    return ops, addrs
+    return ops, addrs, dec
 
 
 def _fresh_slave():
@@ -271,7 +272,7 @@ async def _phase3_bus_runs_a_transform(dut):
     # ~3500 clocks/s, so the whole file is a few seconds either way -- there is no
     # reason to trade coverage for that.
     N = 12000
-    ops, addrs = await _drive_bus(dut, slave, N)
+    ops, addrs, dec = await _drive_bus(dut, slave, N)
 
     dut._log.info("bus activity over %d clocks: %s", N,
                   {"NOP": ops[bus.OP_NOP], "READ": ops[bus.OP_READ],
@@ -331,7 +332,7 @@ async def _phase4_reset_midrun(dut):
     dut.uio_in.value = 1 << FRAME_READY          # rising edge -> start
     await ClockCycles(dut.clk, 1)
     await _settle()
-    ops_a, addrs_a = await _drive_bus(dut, slave_a, N_RUN)
+    ops_a, addrs_a, _ = await _drive_bus(dut, slave_a, N_RUN)
     assert len(addrs_a) >= N_CMP, (
         f"run A only framed {len(addrs_a)} addresses in {N_RUN} clocks -- cannot compare")
     assert ops_a[bus.OP_READ] > 0 and ops_a[bus.OP_WRITE] > 0, (
@@ -369,7 +370,7 @@ async def _phase4_reset_midrun(dut):
     dut.uio_in.value = 1 << FRAME_READY
     await ClockCycles(dut.clk, 1)
     await _settle()
-    ops_b, addrs_b = await _drive_bus(dut, slave_b, N_RUN)
+    ops_b, addrs_b, _ = await _drive_bus(dut, slave_b, N_RUN)
 
     assert addrs_b[:N_CMP] == addrs_a[:N_CMP], (
         "after a mid-run reset the engine did NOT restart from the beginning.\n"
