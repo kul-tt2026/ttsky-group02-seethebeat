@@ -86,11 +86,13 @@ async def test_chip(dut):
     Phase 1: reset, bus direction, sync polarity, a clean scanline.
     Phase 2: no X anywhere on the output pins (the gate-level-specific check).
     Phase 3: run the MCU bus so the FFT engine is actually exercised in the netlist.
+    Phase 4: reset MID-TRANSFORM and prove the chip restarts identically.
     """
     dut._log.info("start (gate level: %s)", GATES)
     await _phase1_reset_and_idle(dut)
     await _phase2_no_x(dut)
     await _phase3_bus_runs_a_transform(dut)
+    await _phase4_reset_midrun(dut)
 
 
 async def _phase1_reset_and_idle(dut):
@@ -169,6 +171,81 @@ async def _phase2_no_x(dut):
     dut._log.info("no X on any output across the sampled window")
 
 
+async def _pulse_reset(dut, cycles=7):
+    """Assert rst_n for `cycles` clocks. Does NOT start a clock -- there is only ever one.
+
+    Frame-ready is dropped as well, so the restart afterwards gets a clean rising edge
+    (`start` in project.v is `ena & uio_in[6] & ~mcu_status_d`, an edge detector).
+    """
+    dut.rst_n.value = 0
+    dut.uio_in.value = 0
+    dut.ui_in.value = 0
+    await ClockCycles(dut.clk, cycles)
+    await _settle()
+    dut.rst_n.value = 1
+    await _settle()
+
+
+async def _drive_bus(dut, slave, n_clocks, frame_ready=1):
+    """Play the MCU memory slave at the pins for `n_clocks`, decoding what the chip emits.
+
+    Returns (ops, addrs): how many of each opcode were framed, and every address seen.
+
+    The decode is done here rather than trusting the slave model, so command FRAMING is
+    checked independently: a T0 must carry a legal opcode, and a READ/WRITE T0 must be
+    followed by its address transfer. Tracking WD0..WD2 is not optional -- a write's payload
+    byte can be 0x3f, which a naive decoder reads as opcode 11 (CFGRD).
+
+    Timing mirrors `_slave_proc` in test_units/test_fft_ctrl.py cycle for cycle: sample the
+    command lane after the edge, step the slave, present its answer for the next edge.
+    """
+    ops = {bus.OP_NOP: 0, bus.OP_READ: 0, bus.OP_WRITE: 0, bus.OP_CFGRD: 0}
+    dec, hi, addrs = "IDLE", 0, []
+
+    for i in range(n_clocks):
+        try:
+            cmd = int(dut.uio_out.value) & CMD_MASK
+        except Exception:
+            raise AssertionError(
+                f"uio_out is {dut.uio_out.value} at clock {i} -- X on the command lane")
+
+        if dec == "IDLE":
+            op = cmd >> 4
+            assert op in ops, f"illegal opcode {op:#04b} on the command lane at clock {i}"
+            ops[op] += 1
+            if op == bus.OP_READ or op == bus.OP_CFGRD:
+                dec, hi = "A1", cmd & 0xF
+            elif op == bus.OP_WRITE:
+                dec, hi = "W1", cmd & 0xF
+        elif dec == "A1":
+            addrs.append((hi << 6) | (cmd & 0x3F)); dec = "IDLE"
+        elif dec == "W1":
+            addrs.append((hi << 6) | (cmd & 0x3F)); dec = "WD0"
+        elif dec == "WD0":
+            dec = "WD1"
+        elif dec == "WD1":
+            dec = "WD2"
+        elif dec == "WD2":
+            dec = "IDLE"
+
+        rv, b = slave.step(cmd)
+        dut.uio_in.value = ((rv & 1) << RESP_VALID) | ((frame_ready & 1) << FRAME_READY)
+        dut.ui_in.value = b & 0xFF
+        await ClockCycles(dut.clk, 1)
+        await _settle()
+
+    return ops, addrs
+
+
+def _fresh_slave():
+    """A slave with a recognisable memory pattern, so a mis-framed address reads as garbage
+    rather than as plausible zeros."""
+    sl = bus.MCUSlave(latency=2)
+    for a in range(1024):
+        sl.sram[a] = (a * 7 + 3) & 0xFFFF
+    return sl
+
+
 async def _phase3_bus_runs_a_transform(dut):
     """Start a transform and service the MCU side, so `mcu_bus` + `fft_ctrl` actually RUN.
 
@@ -183,67 +260,18 @@ async def _phase3_bus_runs_a_transform(dut):
     frames every command correctly, and keeps making progress against a responding slave.
     """
 
-    slave = bus.MCUSlave(latency=2)
-    # A recognisable pattern so a mis-framed address shows up as garbage rather than zeros
-    for a in range(1024):
-        slave.sram[a] = (a * 7 + 3) & 0xFFFF
+    slave = _fresh_slave()
 
     # rising edge of frame-ready starts the transform
     dut.uio_in.value = 1 << FRAME_READY
     await ClockCycles(dut.clk, 1)
     await _settle()
 
-    ops = {bus.OP_NOP: 0, bus.OP_READ: 0, bus.OP_WRITE: 0, bus.OP_CFGRD: 0}
-    dec, hi = "IDLE", 0
-    addrs = []
-
     # Same window at RTL and gate level. Measured from the CI artifact, GL runs at
     # ~3500 clocks/s, so the whole file is a few seconds either way -- there is no
     # reason to trade coverage for that.
     N = 12000
-    for i in range(N):
-        # Sample the command lane after the edge, step the slave, drive its answer for the
-        # NEXT edge. This is deliberately the same ordering as `_slave_proc` in
-        # test_units/test_fft_ctrl.py, which already passes CI -- there is no reason for two
-        # different MCU timings in one repo.
-        try:
-            cmd = int(dut.uio_out.value) & CMD_MASK
-        except Exception:
-            raise AssertionError(
-                f"uio_out is {dut.uio_out.value} at clock {i} -- X on the command lane "
-                "while the engine is running")
-
-        # ---- decode the command lane ourselves, to check FRAMING independently of the
-        #      slave model: every T0 must carry a legal opcode, and a READ/WRITE T0 must
-        #      be followed by its address transfer rather than another opcode. ----
-        if dec == "IDLE":
-            op = cmd >> 4
-            assert op in ops, f"illegal opcode {op:#04b} on the command lane at clock {i}"
-            ops[op] += 1
-            if op == bus.OP_READ or op == bus.OP_CFGRD:
-                dec, hi = "A1", cmd & 0xF
-            elif op == bus.OP_WRITE:
-                dec, hi = "W1", cmd & 0xF
-        elif dec == "A1":
-            addrs.append((hi << 6) | (cmd & 0x3F))
-            dec = "IDLE"
-        elif dec == "W1":
-            addrs.append((hi << 6) | (cmd & 0x3F))
-            dec = "WD0"
-        elif dec == "WD0":
-            dec = "WD1"
-        elif dec == "WD1":
-            dec = "WD2"
-        elif dec == "WD2":
-            dec = "IDLE"
-
-        # ---- run the MCU slave for this cycle and present its answer for the next edge --
-        rv, b = slave.step(cmd)
-        dut.uio_in.value = ((rv & 1) << RESP_VALID) | (1 << FRAME_READY)
-        dut.ui_in.value = b & 0xFF
-
-        await ClockCycles(dut.clk, 1)
-        await _settle()
+    ops, addrs = await _drive_bus(dut, slave, N)
 
     dut._log.info("bus activity over %d clocks: %s", N,
                   {"NOP": ops[bus.OP_NOP], "READ": ops[bus.OP_READ],
@@ -272,3 +300,104 @@ async def _phase3_bus_runs_a_transform(dut):
         await _settle()
     assert lit > 0, "the picture stopped while the FFT was running"
     dut._log.info("VGA still live during the transform (%d lit pixels in a line)", lit)
+
+
+async def _phase4_reset_midrun(dut):
+    """Reset in the MIDDLE of a transform, then prove the chip restarts identically.
+
+    WHY THIS EXISTS (Giel's assistant, 2026-09-01, and it is the right criticism): every
+    other test in this repo resets once, at the start. That proves reset brings the chip UP.
+    It does not prove reset brings the chip BACK -- and "back" is the only recovery mechanism
+    a fabricated chip has. A reset that fails to clear some register only misbehaves when it
+    is asserted while that register holds something, i.e. mid-computation, which is precisely
+    the case nothing was covering.
+
+    The check is a comparison, not an inspection: run a transform partway, reset it, run a
+    second transform against an identical memory, and require the command stream to be the
+    SAME. The FFT is deterministic, so any state that survived the reset -- a stage counter, a
+    butterfly index, a CORDIC iteration, the bus framing FSM -- would make run B start from
+    somewhere else and the addresses would diverge. We do not have to guess which register
+    might be at fault; if any of them is, the sequences differ.
+
+    The reset also lands at an arbitrary point in the bus traffic, so it covers being reset
+    with reads in flight and `resp_valid` asserted.
+    """
+    N_RUN = 900          # long enough to be well inside the first stage of butterflies
+    N_CMP = 24           # addresses compared between the two runs
+
+    # ---------- run A: from a clean reset ----------
+    await _pulse_reset(dut)
+    slave_a = _fresh_slave()
+    dut.uio_in.value = 1 << FRAME_READY          # rising edge -> start
+    await ClockCycles(dut.clk, 1)
+    await _settle()
+    ops_a, addrs_a = await _drive_bus(dut, slave_a, N_RUN)
+    assert len(addrs_a) >= N_CMP, (
+        f"run A only framed {len(addrs_a)} addresses in {N_RUN} clocks -- cannot compare")
+    assert ops_a[bus.OP_READ] > 0 and ops_a[bus.OP_WRITE] > 0, (
+        "run A never got going, so this phase would compare nothing")
+
+    # ---------- reset it mid-flight ----------
+    # No waiting for `done`: interrupting real work is the entire point.
+    await _pulse_reset(dut)
+
+    # ---------- the chip must look exactly like power-on again ----------
+    assert dut.uio_oe.value == 0x3F, (
+        f"after a mid-run reset uio_oe is {dut.uio_oe.value}, expected 0x3F -- the bus "
+        "direction register did not reset")
+    assert dut.uio_out.value == 0, (
+        f"after a mid-run reset uio_out is {dut.uio_out.value}, expected 0 (NOP) -- the bus "
+        "master did not return to idle")
+    uo = int(dut.uo_out.value)
+    assert uo & HSYNC_BIT == 0 and uo & VSYNC_BIT == 0, (
+        f"after a mid-run reset the syncs are not idle low (uo_out={uo:#04x}) -- the VGA "
+        "counters did not reset")
+
+    for i in range(256):                      # no X anywhere, same check as phase 2
+        for name in ("uo_out", "uio_out", "uio_oe"):
+            try:
+                int(getattr(dut, name).value)
+            except Exception:
+                raise AssertionError(
+                    f"{name} is X/Z {i} clocks after a mid-run reset -- something in its "
+                    "cone is only reset from power-on, not from a reset during operation")
+        await ClockCycles(dut.clk, 1)
+        await _settle()
+
+    # ---------- run B: identical stimulus, must produce an identical command stream ----------
+    slave_b = _fresh_slave()
+    dut.uio_in.value = 1 << FRAME_READY
+    await ClockCycles(dut.clk, 1)
+    await _settle()
+    ops_b, addrs_b = await _drive_bus(dut, slave_b, N_RUN)
+
+    assert addrs_b[:N_CMP] == addrs_a[:N_CMP], (
+        "after a mid-run reset the engine did NOT restart from the beginning.\n"
+        f"  run A (clean start) : {addrs_a[:N_CMP]}\n"
+        f"  run B (post-reset)  : {addrs_b[:N_CMP]}\n"
+        "State survived the reset, so a reset in the field would not recover the chip.")
+
+    assert ops_b[bus.OP_READ] == ops_a[bus.OP_READ], (
+        f"read count differs after reset: {ops_a[bus.OP_READ]} vs {ops_b[bus.OP_READ]}")
+    assert ops_b[bus.OP_WRITE] == ops_a[bus.OP_WRITE], (
+        f"write count differs after reset: {ops_a[bus.OP_WRITE]} vs {ops_b[bus.OP_WRITE]}")
+
+    dut._log.info("mid-run reset OK: %d addresses identical, %d reads / %d writes both runs",
+                  N_CMP, ops_a[bus.OP_READ], ops_a[bus.OP_WRITE])
+
+    # ---------- and the picture still works afterwards ----------
+    # Drop resp_valid first: _drive_bus leaves whatever it last drove, and a stuck-high
+    # resp_valid would have the bus master capturing bytes nobody sent. Harmless for the
+    # VGA check, but there is no reason to leave the chip in a state the MCU never creates.
+    dut.uio_in.value = 1 << FRAME_READY
+    hsync_clocks = 0
+    for _ in range(H_TOTAL):
+        uo = int(dut.uo_out.value)
+        if uo & HSYNC_BIT:
+            hsync_clocks += 1
+            assert uo & COLOUR_BITS == 0, "colour leaked into hsync after a mid-run reset"
+        await ClockCycles(dut.clk, 1)
+        await _settle()
+    assert hsync_clocks == H_SYNC_W, (
+        f"hsync is {hsync_clocks} clocks wide after a mid-run reset, expected {H_SYNC_W}")
+    dut._log.info("VGA timing intact after the mid-run reset")
